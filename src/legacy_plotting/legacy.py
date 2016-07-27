@@ -205,7 +205,7 @@ def loadDatasets(explist, n=None, varlist=None, titles=None, periods=None, domai
     if exp[-5:] not in ('-2050','-2100'):
       if prd[:5] in ('2045-','2050-'): newexp = exp + '-2050'
       elif prd[:5] in ('2085-','2090-'): newexp = exp + '-2100' 
-      else: raise IOerror, "Bad Experiment Name {0:}".format(exp)
+      else: newexp = exp
     else: newexp = exp     
     return newexp
 
