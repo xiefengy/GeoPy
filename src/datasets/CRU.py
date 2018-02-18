@@ -13,7 +13,7 @@ import os
 from geodata.base import Variable, Axis
 from geodata.netcdf import DatasetNetCDF
 from geodata.gdal import addGDALtoDataset, GridDefinition
-from datasets.common import translateVarNames, days_per_month, name_of_month, data_root 
+from datasets.common import translateVarNames, days_per_month, name_of_month, getRootFolder 
 from datasets.common import loadObservations, grid_folder, transformPrecip, transformDays, timeSlice
 from processing.process import CentralProcessingUnit
 
@@ -21,7 +21,7 @@ from processing.process import CentralProcessingUnit
 ## CRU Meta-data
 
 dataset_name = 'CRU'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # the dataset root folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 
 # CRU grid definition           
 geotransform = (-180.0, 0.5, 0.0, -90.0, 0.0, 0.5)
@@ -186,10 +186,11 @@ if __name__ == '__main__':
 #   mode = 'test_point_climatology'
 #   mode = 'test_point_timeseries'
   mode = 'average_timeseries'
+  period = (1970,2000)
 #   period = (1971,2001)
 #   period = (1979,2009)
 #   period = (1949,2009)
-  period = (1979,1982)
+#   period = (1979,1982)
 #   period = (1979,1984)
 #   period = (1979,1989)
 #   period = (1979,1994)
@@ -218,12 +219,15 @@ if __name__ == '__main__':
     
     # load original time-series file
     print('')
-    dataset = loadCRU_TS(grid='arb2_d02')
+    dataset = loadCRU_TS(grid=None)
     print(dataset)
     print('')
     print(dataset.time)
     print(dataset.time.coord)
-    print(dataset.time.coord[78*12])
+    assert dataset.time.coord[78*12] == 0
+    print('')
+    print(dataset.precip)
+    print(dataset.precip[0:12,:,:].mean()*86400)
 
 
   elif mode == 'test_point_climatology':
@@ -236,6 +240,7 @@ if __name__ == '__main__':
     print('')
     print(dataset.time)
     print(dataset.time.coord)
+    
         
   elif mode == 'test_point_timeseries':
     

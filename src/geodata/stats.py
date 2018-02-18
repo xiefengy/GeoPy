@@ -92,15 +92,16 @@ def shapiro_wrapper(data, reta=False, ignoreNaN=True):
     nonans = np.invert(np.isnan(data)) # test for NaN's
     if np.sum(nonans) < 3: return np.NaN # return, if less than 3 non-NaN's
     data = data[nonans] # remove NaN's
-  if reta:
-    global shapiro_a
-    if  shapiro_a is None or len(shapiro_a) != len(data)//2:
-      W, pval, a = ss.shapiro(data, a=None, reta=True); del W
-      shapiro_a = a # save parameters
-    else:
-      W, pval = ss.shapiro(data, a=shapiro_a, reta=False); del W
-  else:
-    W, pval = ss.shapiro(data, a=None, reta=False); del W
+#   if reta:
+#     global shapiro_a
+#     if  shapiro_a is None or len(shapiro_a) != len(data)//2:
+#       W, pval, a = ss.shapiro(data, a=None, reta=True); del W
+#       shapiro_a = a # save parameters
+#     else:
+#       W, pval = ss.shapiro(data, a=shapiro_a, reta=False); del W
+#   else:
+  W, pval = ss.shapiro(data, ); del W
+    #W, pval = ss.shapiro(data, a=None, reta=False); del W
   return pval
   # N.B.: a only depends on the length of data, so it can be easily reused in array operation
 
@@ -250,7 +251,7 @@ def ranksums_wrapper(data, size1=None, ignoreNaN=True):
 ## bivariate statistical functions
 
 # Pearson's Correlation Coefficient between two samples
-def pearsonr(sample1, sample2, lpval=False, lrho=True, ignoreNaN=True, lstandardize=False, 
+def pearsonr(sample1, sample2, lpval=False, lrho=True, ignoreNaN=True, lstandardize=False,
              lsmooth=False, window_len=11, window='hanning', ldetrend=False, dof=None, **kwargs):
   ''' Compute and return the linear correlation coefficient and/or the p-value
       of Pearson's correlation. 
@@ -303,7 +304,7 @@ def pearsonr_wrapper(data, size1=None, lpval=False, lrho=True, ignoreNaN=True, l
 
 
 # Spearman's Rank-order Correlation Coefficient between two samples
-def spearmanr(sample1, sample2, lpval=False, lrho=True, ignoreNaN=True, lstandardize=False, 
+def spearmanr(sample1, sample2, lpval=False, lrho=True, ignoreNaN=True, lstandardize=False,
               lsmooth=False, window_len=11, window='hanning', ldetrend=False, dof=None, **kwargs):
   ''' Compute and return the linear correlation coefficient and/or the p-value
       of Spearman's Rank-order Correlation Coefficient. 
@@ -316,7 +317,7 @@ def spearmanr(sample1, sample2, lpval=False, lrho=True, ignoreNaN=True, lstandar
                               lstandardize=lstandardize, ldetrend=ldetrend, dof=dof,
                               lsmooth=lsmooth, window_len=window_len, window=window)
   laax = lsmooth or ldetrend # true, if any of these, false otherwise
-  rvar = apply_stat_test_2samp(sample1, sample2, fct=testfct, 
+  rvar = apply_stat_test_2samp(sample1, sample2, fct=testfct,  
                                lpval=lpval, lrho=lrho, laax=laax, **kwargs)
   return rvar
 spearmancc = spearmanr
@@ -362,13 +363,15 @@ def spearmanr_wrapper(data, size1=None, axis=None, lpval=False, lrho=True, ignor
 
 
 # generic applicator function for 2 sample statistical tests
-def apply_stat_test_2samp(sample1, sample2, fct=None, axis=None, axis_idx=None, name=None, laax=True, 
-                          lflatten=False, fillValue=None, lpval=True, lrho=False, asVar=None,
+def apply_stat_test_2samp(sample1, sample2, fct=None, axis=None, axis_idx=None, axes=None, name=None, laax=True, 
+                          lflatten=False, fillValue=None, lpval=True, lrho=False, asVar=None, keepdims=False,
                           lcheckVar=True, lcheckAxis=True, pvaratts=None, rvaratts=None, **kwargs):
   ''' Apply a bivariate statistical test or function to two sample Variables and return the result 
       as a Variable object; the function will be applied along the specified axis or over flattened arrays. 
       This function can return both, the p-value and the function result (other than the p-value). '''
   # some input checking
+  if axes is not None and axis is not None: raise ArgumentError
+  elif axes and axis is None: axis = axes
   if lflatten and axis is not None: raise ArgumentError
   if not lflatten and axis is None and axis_idx is None: 
     if sample2.ndim > 1 and sample2.ndim > 1: raise ArgumentError
@@ -387,14 +390,17 @@ def apply_stat_test_2samp(sample1, sample2, fct=None, axis=None, axis_idx=None, 
   elif axis_idx is None and axis is not None: 
     if not lvar1 and not lvar2: ArgumentError, "Keyword 'axis' requires at least one sample to be a Variable instance."
     if isinstance(axis,(tuple,list)):
-      if not lvar1 or not lvar2: ArgumentError, "Merging multiple 'axis' requires both samples to be a Variable instances."
-      # if sample includes multiple axes, merge them and introduce new sample axis
-      sample1 = sample1.mergeAxes(axes=axis, new_axis='new_KS_sample_axis', asVar=True, linplace=False, lcheckAxis=lcheckAxis)
-      sample2 = sample2.mergeAxes(axes=axis, new_axis='new_KS_sample_axis', asVar=True, linplace=False, lcheckAxis=lcheckAxis)
-      if sample1 is None or sample2 is None: 
-        if lcheckAxis: raise AxisError, sample1 or sample2
-        else: return None
-      axis = 'new_KS_sample_axis' # now operate on the new sample axis, as if it was just one    
+      if len(axis) == 1: 
+          axis = axis[0] # trivial case
+      else:
+          if not lvar1 or not lvar2: ArgumentError, "Merging multiple 'axis' requires both samples to be a Variable instances."
+          # if sample includes multiple axes, merge them and introduce new sample axis
+          sample1 = sample1.mergeAxes(axes=axis, new_axis='new_KS_sample_axis', asVar=True, linplace=False, lcheckAxis=lcheckAxis)
+          sample2 = sample2.mergeAxes(axes=axis, new_axis='new_KS_sample_axis', asVar=True, linplace=False, lcheckAxis=lcheckAxis)
+          if sample1 is None or sample2 is None: 
+            if lcheckAxis: raise AxisError, sample1 or sample2
+            else: return None
+          axis = 'new_KS_sample_axis' # now operate on the new sample axis, as if it was just one    
     if lvar1: axis_idx1 = sample1.axisIndex(axis)
     if lvar2: axis_idx2 = sample2.axisIndex(axis)
     if not lvar1: axis_idx1 = axis_idx2
@@ -510,16 +516,30 @@ def apply_stat_test_2samp(sample1, sample2, fct=None, axis=None, axis_idx=None, 
       assert res.ndim == sample1.ndim
       assert res.shape == rshape+(2,)
       res = np.rollaxis(res, axis=res.ndim-1, start=0)
-      rvar = res[0,:]; pvar = res[1,:]
+      if res.ndim == 1: rvar = res[0,]; pvar = res[1,]
+      else: rvar = res[0,:]; pvar = res[1,:]        
     else:
       assert res.ndim == sample1.ndim-1
       assert res.shape == rshape
       if lpval: pvar = res
       elif lrho: rvar = res
+    newaxes = sample1.axes[:axis_idx1] + sample1.axes[axis_idx1+1:]
+    if keepdims:
+        remaxes = [ax.name for ax in newaxes]
+        newaxes = []; newshp = []
+        for ax in sample1.axes:
+            if ax.name in remaxes:
+                # make copy of old axis as is
+                newaxes.append(ax.copy()); newshp.append(len(ax))
+            else:
+                # create a new axis with same attributes but length 1 and NaN as coordinate vectore
+                newax = Axis(coord=[np.NaN], atts=ax.atts)
+                newaxes.append(newax); newshp.append(1)
+        if lrho: rvar = rvar.reshape(newshp)
+        if lpval: pvar = pvar.reshape(newshp)
     if asVar:
-      axes = sample1.axes[:axis_idx1] + sample1.axes[axis_idx1+1:]
-      if lpval: pvar = Variable(data=pvar, axes=axes, atts=pvaratts, plot=pvarplot)
-      if lrho: rvar = Variable(data=rvar, axes=axes, atts=rvaratts, plot=rvarplot)
+      if lrho: rvar = Variable(data=rvar, axes=newaxes, atts=rvaratts, plot=rvarplot)
+      if lpval: pvar = Variable(data=pvar, axes=newaxes, atts=pvaratts, plot=pvarplot)
   # return results
   if lrho and lpval: return rvar, pvar
   elif lpval: return pvar
@@ -777,6 +797,9 @@ class DistVar(Variable):
     # N.B.: in this variable dtype and units refer to the sample data, not the distribution!
     if params.ndim > 0 and self.hasAxis(params_name):
       self.paramAxis = self.getAxis(params_name) 
+    if lbootstrap:
+      self.bootstrap_axis = self.axes[0]
+      assert self.hasAxis(self.bootstrap_axis, strict=True)
     # aliases
     self.pdf = self.PDF
     self.cdf = self.CDF
@@ -1267,7 +1290,7 @@ def rv_stats_test(data_array, nparams=0, dist_type=None, stats_test=None, ignore
     elif stats_test in ('normtest','normaltest'): 
       pval = normaltest_wrapper(data_array[nparams:], ignoreNaN=ignoreNaN)
     elif stats_test in ('sw','shapiro','shapirowilk'): 
-      pval = shapiro_wrapper(data_array[nparams:], ignoreNaN=ignoreNaN, reta=reta)    
+      pval = shapiro_wrapper(data_array[nparams:], ignoreNaN=ignoreNaN)    
     else: raise ArgumentError, stats_test
   return pval
 
@@ -1304,10 +1327,13 @@ class VarRV(DistVar):
                          #N=2000, alternative='two-sided', mode='approx',
                          asVar=False, lcheckVar=True, lcheckAxis=True).mean()
       #pval = pval if isinstance(pval,(str,basestring)) else "{:3.2f}".format(pval)
-      pval = "{:3.2f}".format(float(pval.mean()))
-      if self.crossval > 1: crossval = "1/{:d}".format(self.crossval)
-      else: crossval = "{:2.0%}".format(self.crossval)
-      print("{:s} Cross-validation: {:s} (K-S test, {:s})".format(self.name, pval, crossval)) 
+      if pval is np.ma.masked: 
+        print("Unable to evaluate cross-validation: too many invalid/masked values")
+      else:
+        pval = "{:3.2f}".format(float(pval))
+        if self.crossval > 1: crossval = "1/{:d}".format(self.crossval)
+        else: crossval = "{:2.0%}".format(self.crossval)
+        print("{:s} Cross-validation: {:s} (K-S test, {:s})".format(self.name, pval, crossval)) 
   
   def copy(self, deepcopy=False, **newargs): # this methods will have to be overloaded, if class-specific behavior is desired
     ''' A method to copy the Variable with just a link to the data. '''
@@ -1319,6 +1345,8 @@ class VarRV(DistVar):
     ''' use methods of from RV distribution through _get_dist wrapper '''
     if hasattr(self.dist_class, attr):
       attr = functools.partial(self._get_dist, self._compute_distribution, attr, rv_fct=attr)
+    else: 
+      raise AttributeError("The distribution class '{}' does not support the method/attibute '{}'.".format(self.dist_class.__class__.__name__, attr))
     return attr
   
   # distribution-specific method; should be overloaded by subclass
@@ -1526,7 +1554,7 @@ class VarRV(DistVar):
       idx_dtype = np.int16 if sz < 32767 else (np.int32 if sz < 2147483647 else np.int64) # save some memory
       if self.crossval_mask is not None: # created for random subset (default)
         assert self.crossval_mask.shape == sample_data.shape, self.crossval_mask.shape 
-        check_mask = self.crossval_mask.sum(axis=-1); mask_len = check_mask.mean() 
+        check_mask = self.crossval_mask.sum(axis=-1); mask_len = int(check_mask.mean())
         subsample = np.zeros(check_mask.shape+(mask_len,), dtype=sample_data.dtype, order='C')
         apply_over_arrays(np.compress, self.crossval_mask, sample_data, out=subsample, axis=-1)
         sample_data = subsample # replace sample with appropriate sub-sample

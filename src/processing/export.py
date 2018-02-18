@@ -7,22 +7,24 @@ A script to convert datasets to raster format using GDAL.
 '''
 
 # external imports
-import os, shutil # check if files are present etc.
+try: import cPickle as pickle
+except: import pickle
+import os, shutil, gzip # check if files are present etc.
 import numpy as np
 from importlib import import_module
 from datetime import datetime
 import logging     
 # internal imports
-from geodata.base import Dataset
+from geodata.base import Dataset, concatDatasets
 from geodata.gdal import addGDALtoDataset, addGDALtoVar
-from geodata.misc import DateError, printList, ArgumentError, VariableError,\
-  GDALError
+from geodata.misc import DateError, DatasetError, printList, ArgumentError, VariableError, GDALError
 from datasets import gridded_datasets
 from processing.multiprocess import asyncPoolEC
 from processing.misc import getMetaData,  getExperimentList, loadYAML, getTargetFile
-# new variable functions
-import processing.newvars as newvars
 from utils.nctools import writeNetCDF
+# new variable functions and bias-correction 
+import processing.newvars as newvars
+from processing.bc_methods import getPickleFileName
 
 ## helper classes to handle different file formats
 
@@ -56,9 +58,14 @@ class FileFormat(object):
 class NetCDF(object):
   ''' A class to handle exports to NetCDF format (v4 by default). '''
   
-  def __init__(self, project=None, filetype='aux', folder=None, **expargs):
+  def __init__(self, project=None, filetype='aux', folder=None, bc_method=None, **expargs):
     ''' take arguments that have been passed from caller and initialize parameters '''
-    self.filetype = filetype; self.folder_pattern = folder
+    if bc_method:
+      if not filetype: filetype = bc_method.lower()
+      elif filetype != bc_method.lower():
+          raise ArgumentError(filetype, bc_method)
+    self.bc_method = bc_method
+    self.filetype = filetype; self.folder_pattern = folder    
     self.export_arguments = expargs
   
   @property
@@ -66,15 +73,14 @@ class NetCDF(object):
     ''' access output destination '''
     return self.filepath
   
-  def defineDataset(self, name=None, dataset=None, mode=None, dataargs=None, lwrite=True, ldebug=False):
+  def defineDataset(self, dataset=None, mode=None, bc_method=None, dataargs=None, lwrite=True, ldebug=False):
     ''' a method to set external parameters about the Dataset, so that the export destination
         can be determined (and returned) '''
     # get filename for target dataset and do some checks
     if self.folder_pattern is None: avgfolder = dataargs.avgfolder # regular source dataset location
-    else: self.folder_pattern.format(dataset, self.project, name,) # this could be expanded with dataargs 
+    else: self.folder_pattern.format(dataset, self.project, dataargs.dataset_name,) # this could be expanded with dataargs 
     if not os.path.exists(avgfolder): raise IOError, "Dataset folder '{:s}' does not exist!".format(avgfolder)
-    filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, 
-                             grid=None, period=None, filetype=self.filetype)
+    filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, filetype=self.filetype)
     if ldebug: filename = 'test_{:s}'.format(filename)
     self.filepath = '{:s}/{:s}'.format(avgfolder,filename)
     return self.filepath
@@ -106,9 +112,9 @@ class NetCDF(object):
 class ASCII_raster(FileFormat):
   ''' A class to handle exports to ASCII_raster format. '''
   
-  def __init__(self, project=None, folder=None, prefix=None, **expargs):
+  def __init__(self, project=None, folder=None, prefix=None, bc_method=None, **expargs):
     ''' take arguments that have been passed from caller and initialize parameters '''
-    self.project = project; self.folder_pattern = folder; self.prefix_pattern = prefix
+    self.project = project; self.folder_pattern = folder; self.prefix_pattern = prefix; self.bc_method = bc_method
     self.export_arguments = expargs
   
   @property
@@ -116,25 +122,49 @@ class ASCII_raster(FileFormat):
     ''' access output destination '''
     return self.folder
       
-  def defineDataset(self, name=None, dataset=None, mode=None, dataargs=None, lwrite=True, ldebug=False):
+  def defineDataset(self, dataset=None, mode=None, dataargs=None, lwrite=True, ldebug=False):
     ''' a method to set exteral parameters about the Dataset, so that the export destination
         can be determined (and returned) '''
     # extract variables
-    dataset_name = dataargs.dataset_name; periodstr = dataargs.periodstr
-    grid = dataargs.grid; domain = dataargs.domain
+    dataset_name = dataargs.dataset_name; domain = dataargs.domain; grid = dataargs.grid
+    if dataargs.period is None: periodstr = None
+    elif isinstance(dataargs.period,(tuple,list)):
+      periodstr = '{0:02d}'.format(int(dataargs.period[1]-dataargs.period[0]))
+    else: periodstr = '{0:02d}'.format(dataargs.period)
+    lnkprdstr = dataargs.periodstr
     # assemble specific names
     expname = '{:s}_d{:02d}'.format(dataset_name,domain) if domain else dataset_name
-    expprd = 'clim_{:s}'.format(periodstr) if periodstr else 'timeseries'
+    if mode == 'climatology': 
+      expprd = 'clim' if periodstr is None else 'clim_{:s}'.format(periodstr) 
+      lnkprd = 'clim' if lnkprdstr is None else 'clim_{:s}'.format(lnkprdstr)
+    elif mode == 'time-series': 
+      expprd = 'timeseries'; lnkprd = None
+    elif mode[-5:] == '-mean': 
+      expprd = mode[:-5] if periodstr is None else '{:s}_{:s}'.format(mode[:-5],periodstr)
+      lnkprd = mode[:-5] if lnkprdstr is None else '{:s}_{:s}'.format(mode[:-5],lnkprdstr)
+    else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)        
     # insert into patterns 
-    self.folder = self.folder_pattern.format(self.project, grid, expname, expprd)
+    metadict = dict(PROJECT=self.project, GRID=grid, EXPERIMENT=expname, PERIOD=expprd, 
+                    RESOLUTION=dataargs.resolution, BIAS=self.bc_method)
+    self.folder = self.folder_pattern.format(**metadict)
     if ldebug: self.folder = self.folder + '/test/' # test in subfolder
-    self.prefix = self.prefix_pattern.format(self.project, grid, expname, expprd)
+    self.prefix = self.prefix_pattern.format(**metadict) if self.prefix_pattern else None
+    # create link with alternate period designation
+    self.altprdlnk = None
+    if lnkprd is not None and hasattr(os,'symlink'): # Windows does not have symlinks, so this does not work
+      i = self.folder_pattern.find('{PERIOD')
+      if i > -1:
+        root_folder = self.folder_pattern[:i].format(**metadict)
+        period_pattern = self.folder_pattern[i:].split('/')[0]
+        link_name = period_pattern.format(PERIOD=lnkprd)
+        link_dest = period_pattern.format(PERIOD=expprd)
+        self.altprdlnk = (root_folder, link_dest, link_name)
     # return folder (no filename)
     return self.folder
   
   def prepareDestination(self, srcage=None, loverwrite=False):
     ''' create or clear the destination folder, as necessary, and check if source is newer (for skipping) '''
-    # prepare target dataset (which is mainly just a folder)
+    ## prepare target dataset (which is mainly just a folder)
     if not os.path.exists(self.folder): 
       # create new folder
       os.makedirs(self.folder)
@@ -146,8 +176,21 @@ class ASCII_raster(FileFormat):
     else:
       age = datetime.fromtimestamp(os.path.getmtime(self.folder))
       # if source file is newer than target folder, recompute, otherwise skip
-      lskip = ( age > srcage ) # skip if newer than source    
+      lskip = ( age > srcage ) # skip if newer than source 
     if not os.path.exists(self.folder): raise IOError, self.folder
+    ## put in alternative symlink (relative path) for period section
+    if self.altprdlnk:
+      root_folder, link_dest, link_name = self.altprdlnk
+      pwd = os.getcwd(); os.chdir(root_folder)
+      if not os.path.exists(link_name): 
+        os.symlink(link_dest, link_name) # create new symlink
+      if os.path.islink(link_name): 
+        os.remove(link_name) # remove old link before creating new one
+        os.symlink(link_dest, link_name) # create new symlink      
+      elif loverwrite:  
+        shutil.rmtree(link_name) # remove old folder and contents
+        os.symlink(link_dest, link_name) # create new symlink
+      os.chdir(pwd) # return to original directory
     # return with a decision on skipping
     return lskip 
     
@@ -160,350 +203,517 @@ class ASCII_raster(FileFormat):
     if not os.path.exists(filedict.values()[-1][-1]): raise IOError, filedict.values()[-1][-1] # random check
 
   
-def getFileFormat(fileformat, **expargs):
+def getFileFormat(fileformat, bc_method=None, **expargs):
   ''' function that returns an instance of a specific FileFormat child class specified in expformat; 
       other kwargs are passed on to constructor of FileFormat '''
   # decide based on expformat; instantiate object
   if fileformat == 'ASCII_raster':
-    return ASCII_raster(**expargs)
+    return ASCII_raster(bc_method=bc_method, **expargs)
   elif fileformat.lower() in ('netcdf','netcdf4'):
-    return NetCDF(**expargs)
+    return NetCDF(bc_method=bc_method, **expargs)
   else:
     raise NotImplementedError, fileformat
   
 
-# worker function that is to be passed to asyncPool for parallel execution; use of the decorator is assumed
-def performExport(dataset, mode, dataargs, expargs, loverwrite=False, 
+# worker function that is to be passed to asyncPool for parallel execution; use of the TrialNError decorator is assumed
+def performExport(dataset, mode, dataargs, expargs, bcargs, loverwrite=False, 
                   ldebug=False, lparallel=False, pidstr='', logger=None):
-  ''' worker function to perform regridding for a given dataset and target grid '''
-  # input checking
-  if not isinstance(dataset,basestring): raise TypeError
-  if not isinstance(dataargs,dict): raise TypeError # all dataset arguments are kwargs 
+    ''' worker function to export ASCII rasters for a given dataset '''
+    # input checking
+    if not isinstance(dataset,basestring): raise TypeError
+    if not isinstance(dataargs,dict): raise TypeError # all dataset arguments are kwargs 
+    
+    # logging
+    if logger is None: # make new logger     
+        logger = logging.getLogger() # new logger
+        logger.addHandler(logging.StreamHandler())
+    else:
+        if isinstance(logger,basestring): 
+            logger = logging.getLogger(name=logger) # connect to existing one
+        elif not isinstance(logger,logging.Logger): 
+            raise TypeError, 'Expected logger ID/handle in logger KW; got {}'.format(str(logger))
   
-  # logging
-  if logger is None: # make new logger     
-    logger = logging.getLogger() # new logger
-    logger.addHandler(logging.StreamHandler())
-  else:
-    if isinstance(logger,basestring): 
-      logger = logging.getLogger(name=logger) # connect to existing one
-    elif not isinstance(logger,logging.Logger): 
-      raise TypeError, 'Expected logger ID/handle in logger KW; got {}'.format(str(logger))
-
-  ## extract meta data from arguments
-  dataargs, loadfct, srcage, datamsgstr = getMetaData(dataset, mode, dataargs, lone=False)
-  dataset_name = dataargs.dataset_name; periodstr = dataargs.periodstr; domain = dataargs.domain
+    ## extract meta data from arguments
+    dataargs, loadfct, srcage, datamsgstr = getMetaData(dataset, mode, dataargs, lone=False)
+    dataset_name = dataargs.dataset_name; periodstr = dataargs.periodstr; domain = dataargs.domain
+    
+    # figure out bias correction parameters
+    if bcargs:
+        bcargs = bcargs.copy() # first copy, then modify...
+        bc_method = bcargs.pop('method',None)
+        if bc_method is None: raise ArgumentError("Need to specify bias-correction method to use bias correction!")
+        bc_obs = bcargs.pop('obs_dataset',None)
+        if bc_obs is None: raise ArgumentError("Need to specify observational dataset to use bias correction!")
+        bc_reference = bcargs.pop('reference',None)
+        if bc_reference is None: # infer from experiment name
+            if dataset_name[-5:] in ('-2050','-2100'): bc_reference = dataset_name[:-5] # cut of period indicator and hope for the best 
+            else: bc_reference = dataset_name 
+        bc_grid = bcargs.pop('grid',None)
+        if bc_grid is None: bc_grid = dataargs.grid
+        bc_domain = bcargs.pop('domain',None)
+        if bc_domain is None: bc_domain = domain
+        bc_varlist = bcargs.pop('varlist',None)
+        bc_varmap = bcargs.pop('varmap',None)       
+        bc_tag = bcargs.pop('tag',None) # an optional name extension/tag
+        bc_pattern = bcargs.pop('file_pattern',None) # usually default in getPickleFile
+        lgzip = bcargs.pop('lgzip',None) # if pickle is gzipped (None: auto-detect based on file name extension)
+        # get name of pickle file (and folder)
+        picklefolder = dataargs.avgfolder.replace(dataset_name,bc_reference)
+        picklefile = getPickleFileName(method=bc_method, obs_name=bc_obs, gridstr=bc_grid, domain=bc_domain, 
+                                       tag=bc_tag, pattern=bc_pattern)
+        picklepath = '{:s}/{:s}'.format(picklefolder,picklefile)
+        if lgzip:
+            picklepath += '.gz' # add extension
+            if not os.path.exists(picklepath): raise IOError(picklepath)
+        elif lgzip is None:
+            lgzip = False
+            if not os.path.exists(picklepath):
+                lgzip = True # assume gzipped file
+                picklepath += '.gz' # try with extension...
+                if not os.path.exists(picklepath): raise IOError(picklepath)
+        elif not os.path.exists(picklepath): raise IOError(picklepath)
+        pickleage = datetime.fromtimestamp(os.path.getmtime(picklepath))
+        # determine age of pickle file and compare against source age
+    else:
+      bc_method = False 
+      pickleage = srcage
+    
+    # parse export options
+    expargs = expargs.copy() # first copy, then modify...
+    lm3 = expargs.pop('lm3') # convert kg/m^2/s to m^3/m^2/s (water flux)
+    expformat = expargs.pop('format') # needed to get FileFormat object
+    exp_list= expargs.pop('exp_list') # this handled outside of export
+    compute_list = expargs.pop('compute_list', []) # variables to be (re-)computed - by default all
+    # initialize FileFormat class instance
+    fileFormat = getFileFormat(expformat, bc_method=bc_method, **expargs)
+    # get folder for target dataset and do some checks
+    expname = '{:s}_d{:02d}'.format(dataset_name,domain) if domain else dataset_name
+    expfolder = fileFormat.defineDataset(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=True, ldebug=ldebug)
   
-  # parse export options
-  expargs = expargs.copy() # first copy, then modify...
-  lm3 = expargs.pop('lm3') # convert kg/m^2/s to m^3/m^2/s (water flux)
-  expformat = expargs.pop('format') # needed to get FileFormat object
-  varlist = expargs.pop('varlist') # this handled outside of export
-  # initialize FileFormat class instance
-  fileFormat = getFileFormat(expformat, **expargs)
-  # get folder for target dataset and do some checks
-  expname = '{:s}_d{:02d}'.format(dataset_name,domain) if domain else dataset_name
-  expfolder = fileFormat.defineDataset(name=dataset_name, dataset=dataset, mode=mode, dataargs=dataargs, lwrite=True, ldebug=ldebug)
-
-  # prepare destination for new dataset
-  lskip = fileFormat.prepareDestination(srcage=srcage, loverwrite=loverwrite)
+    # prepare destination for new dataset
+    lskip = fileFormat.prepareDestination(srcage=max(srcage,pickleage), loverwrite=loverwrite)
   
-  # depending on last modification time of file or overwrite setting, start computation, or skip
-  if lskip:        
-    # print message
-    skipmsg =  "\n{:s}   >>>   Skipping: Format '{:s} for dataset '{:s}' already exists and is newer than source file.".format(pidstr,expformat,dataset_name)
-    skipmsg += "\n{:s}   >>>   ('{:s}')\n".format(pidstr,expfolder)
-    logger.info(skipmsg)              
-  else:
-          
-    ## actually load datasets
-    source = loadfct() # load source data
-    # check period
-    if 'period' in source.atts and dataargs.periodstr != source.atts.period: # a NetCDF attribute
-      raise DateError, "Specifed period is inconsistent with netcdf records: '{:s}' != '{:s}'".format(periodstr,source.atts.period)
-
-    # print message
-    if mode == 'climatology': opmsgstr = 'Exporting Climatology ({:s}) to {:s} Format'.format(periodstr, expformat)
-    elif mode == 'time-series': opmsgstr = 'Exporting Time-series to {:s} Format'.format(expformat)
-    else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)        
-    # print feedback to logger
-    logger.info('\n{0:s}   ***   {1:^65s}   ***   \n{0:s}   ***   {2:^65s}   ***   \n'.format(pidstr,datamsgstr,opmsgstr))
-    if not lparallel and ldebug: logger.info('\n'+str(source)+'\n')
-    
-    # create GDAL-enabled target dataset
-    sink = Dataset(axes=(source.xlon,source.ylat), name=expname, title=source.title)
-    addGDALtoDataset(dataset=sink, griddef=source.griddef)
-    assert sink.gdal, sink
-    
-    # N.B.: data are not loaded immediately but on demand; this way I/O and computing are further
-    #       disentangled and not all variables are always needed
-    
-    # Compute intermediate variables, if necessary
-    for varname in varlist:
-      vars = None # variable list
-      if varname in source:
-        var = source[varname].load() # load data (may not have to load all)
-      else:
-        var = None
-        if varname == 'waterflx': var = newvars.computeWaterFlux(source)
-        elif varname == 'liqwatflx': var = newvars.computeLiquidWaterFlux(source)
-        elif varname == 'netrad': var = newvars.computeNetRadiation(source, asVar=True)
-        elif varname == 'netrad_0': var = newvars.computeNetRadiation(source, asVar=True, lA=False, name='netrad_0')
-        elif varname == 'netrad_bb': var = newvars.computeNetRadiation(source, asVar=True, lrad=False, name='netrad_bb')
-        elif varname == 'vapdef': var = newvars.computeVaporDeficit(source)
-        elif varname == 'pet' or varname == 'pet_pm':
-          vars = newvars.computePotEvapPM(source, lterms=True) # default; returns mutliple PET terms
-          #var = newvars.computePotEvapPM(source, lterms=False) # returns only PET
-        elif varname == 'pet_th': var = None # skip for now
-          #var = computePotEvapTh(source) # simplified formula (less prerequisites)
-        else: raise VariableError, "Unsupported Variable '{:s}'.".format(varname)
-      # for now, skip variables that are None
-      if var or vars:
-        # handle lists as well
-        if var and vars: raise VariableError, (var,vars)
-        if var: vars = (var,)
-        for var in vars:
-          addGDALtoVar(var=var, griddef=sink.griddef)
-          if not var.gdal and isinstance(fileFormat,ASCII_raster):
-            raise GDALError, "Exporting to ASCII_raster format requires GDAL-enabled variables."
-          # add to new dataset
-          sink += var
-    # convert units
-    if lm3:
-      for var in sink:
-        if var.units == 'kg/m^2/s':
-          var /= 1000. # divide to get m^3/m^2/s
-          var.units = 'm^3/m^2/s' # update units
-    
-    # print dataset
-    if not lparallel and ldebug:
-      logger.info('\n'+str(sink)+'\n')
+    # depending on last modification time of file or overwrite setting, start computation, or skip
+    if lskip:        
+        # print message
+        skipmsg =  "\n{:s}   >>>   Skipping: Format '{:s} for dataset '{:s}' already exists and is newer than source file.".format(pidstr,expformat,dataset_name)
+        skipmsg += "\n{:s}   >>>   ('{:s}')\n".format(pidstr,expfolder)
+        logger.info(skipmsg)              
+    else:
+            
+      ## actually load datasets
+      source = loadfct() # load source data
+      # check period
+      if 'period' in source.atts and dataargs.periodstr != source.atts.period: # a NetCDF attribute
+          raise DateError, "Specifed period is inconsistent with netcdf records: '{:s}' != '{:s}'".format(periodstr,source.atts.period)
       
-    # export new dataset to selected format
-    fileFormat.exportDataset(sink)
+      # load BiasCorrection object from pickle
+      if bc_method:      
+          op = gzip.open if lgzip else open
+          with op(picklepath, 'r') as filehandle:
+              BC = pickle.load(filehandle) 
+          # assemble logger entry
+          bcmsgstr = "(performing bias-correction using {:s} from {:s} towards {:s})".format(BC.long_name,bc_reference,bc_obs)
       
-    # write results to file
-    writemsg =  "\n{:s}   >>>   Export of Dataset '{:s}' to Format '{:s}' complete.".format(pidstr,expname, expformat)
-    writemsg += "\n{:s}   >>>   ('{:s}')\n".format(pidstr,expfolder)
-    logger.info(writemsg)      
-       
-    # clean up and return
-    source.unload(); #del source
-    return 0 # "exit code"
-    # N.B.: garbage is collected in multi-processing wrapper
+      # print message
+      if mode == 'climatology': opmsgstr = 'Exporting Climatology ({:s}) to {:s} Format'.format(periodstr, expformat)
+      elif mode == 'time-series': opmsgstr = 'Exporting Time-series to {:s} Format'.format(expformat)
+      elif mode[-5:] == '-mean': opmsgstr = 'Exporting {:s}-Mean ({:s}) to {:s} Format'.format(mode[:-5], periodstr, expformat)
+      else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)        
+      # print feedback to logger
+      logmsg = '\n{0:s}   ***   {1:^65s}   ***   \n{0:s}   ***   {2:^65s}   ***   \n'.format(pidstr,datamsgstr,opmsgstr)
+      if bc_method:
+          logmsg += "{0:s}   ***   {1:^65s}   ***   \n".format(pidstr,bcmsgstr)
+      logger.info(logmsg)
+      if not lparallel and ldebug: logger.info('\n'+str(source)+'\n')
+      
+      # create GDAL-enabled target dataset
+      sink = Dataset(axes=(source.xlon,source.ylat), name=expname, title=source.title, atts=source.atts.copy())
+      addGDALtoDataset(dataset=sink, griddef=source.griddef)
+      assert sink.gdal, sink
+      
+      # apply bias-correction
+      if bc_method:
+          source = BC.correct(source, asNC=False, varlist=bc_varlist, varmap=bc_varmap) # load bias-corrected variables into memory
+        
+      # N.B.: for variables that are not bias-corrected, data are not loaded immediately but on demand; this way 
+      #       I/O and computing can be further disentangled and not all variables are always needed
+      
+      # compute intermediate variables, if necessary
+      for varname in exp_list:
+          variables = None # variable list
+          var = None
+          # (re-)compute variable, if desired...
+          if varname in compute_list:
+              if varname == 'precip': var = newvars.computeTotalPrecip(source)
+              elif varname == 'waterflx': var = newvars.computeWaterFlux(source)
+              elif varname == 'liqwatflx': var = newvars.computeLiquidWaterFlux(source)
+              elif varname == 'netrad': var = newvars.computeNetRadiation(source, asVar=True)
+              elif varname == 'netrad_bb': var = newvars.computeNetRadiation(source, asVar=True, lrad=False, name='netrad_bb')
+              elif varname == 'netrad_bb0': var = newvars.computeNetRadiation(source, asVar=True, lrad=False, lA=False, name='netrad_bb0')
+              elif varname == 'vapdef': var = newvars.computeVaporDeficit(source)
+              elif varname in ('pet','pet_pm','petrad','petwnd') and 'pet' not in sink:
+                  if 'petrad' in exp_list or 'petwnd' in exp_list:
+                      variables = newvars.computePotEvapPM(source, lterms=True) # default; returns mutliple PET terms
+                  else: var = newvars.computePotEvapPM(source, lterms=False) # returns only PET
+              elif varname == 'pet_th': var = None # skip for now
+                  #var = computePotEvapTh(source) # simplified formula (less prerequisites)
+          # ... otherwise load from source file
+          if var is None and variables is None and varname in source:
+              var = source[varname].load() # load data (may not have to load all)
+          #else: raise VariableError, "Unsupported Variable '{:s}'.".format(varname)
+          # for now, skip variables that are None
+          if var or variables:
+              # handle lists as well
+              if var and variables: raise VariableError, (var,variables)
+              elif var: variables = (var,)
+              for var in variables:
+                  addGDALtoVar(var=var, griddef=sink.griddef)
+                  if not var.gdal and isinstance(fileFormat,ASCII_raster):
+                      raise GDALError, "Exporting to ASCII_raster format requires GDAL-enabled variables."
+                  # add to new dataset
+                  sink += var
+      # convert units
+      if lm3:
+          for var in sink:
+              if var.units == 'kg/m^2/s':
+                  var /= 1000. # divide to get m^3/m^2/s
+                  var.units = 'm^3/m^2/s' # update units
+      
+      # compute seasonal mean if we are in mean-mode
+      if mode[-5:] == '-mean': 
+          sink = sink.seasonalMean(season=mode[:-5], lclim=True)
+          # N.B.: to remain consistent with other output modes, 
+          #       we need to prevent renaming of the time axis
+          sink = concatDatasets([sink,sink], axis='time', lensembleAxis=True)
+          sink.squeeze() # we need the year-axis until now to distinguish constant fields; now remove
+      
+      # print dataset
+      if not lparallel and ldebug:
+          logger.info('\n'+str(sink)+'\n')
+        
+      # export new dataset to selected format
+      fileFormat.exportDataset(sink)
+        
+      # write results to file
+      writemsg =  "\n{:s}   >>>   Export of Dataset '{:s}' to Format '{:s}' complete.".format(pidstr,expname, expformat)
+      writemsg += "\n{:s}   >>>   ('{:s}')\n".format(pidstr,expfolder)
+      logger.info(writemsg)      
+         
+      # clean up and return
+      source.unload(); #del source
+      return 0 # "exit code"
+      # N.B.: garbage is collected in multi-processing wrapper
 
 
 if __name__ == '__main__':
   
-  ## read environment variables
-  # number of processes NP 
-  if os.environ.has_key('PYAVG_THREADS'): 
-    NP = int(os.environ['PYAVG_THREADS'])
-  else: NP = None
-  # run script in debug mode
-  if os.environ.has_key('PYAVG_DEBUG'): 
-    ldebug =  os.environ['PYAVG_DEBUG'] == 'DEBUG' 
-  else: ldebug = False
-  # run script in batch or interactive mode
-  if os.environ.has_key('PYAVG_BATCH'): 
-    lbatch =  os.environ['PYAVG_BATCH'] == 'BATCH' 
-  else: lbatch = False # for debugging
-  # re-compute everything or just update 
-  if os.environ.has_key('PYAVG_OVERWRITE'): 
-    loverwrite =  os.environ['PYAVG_OVERWRITE'] == 'OVERWRITE' 
-  else: loverwrite = ldebug # False means only update old files
-  
-  ## define settings
-  if lbatch:
-    # load YAML configuration
-    config = loadYAML('export.yaml', lfeedback=True)
-    # read config object
-    NP = NP or config['NP']
-    loverwrite = config['loverwrite']
-    # source data specs
-    modes = config['modes']
-    load_list = config['load_list']
-    periods = config['periods']
-    # Datasets
-    datasets = config['datasets']
-    resolutions = config['resolutions']
-    lLTM = config['lLTM']
-    # CESM
-    CESM_project = config['CESM_project']
-    CESM_experiments = config['CESM_experiments']
-    CESM_filetypes = config['CESM_filetypes']
-    load3D = config['load3D']
-    # WRF
-    WRF_project = config['WRF_project']
-    WRF_experiments = config['WRF_experiments']
-    WRF_filetypes = config['WRF_filetypes']
-    domains = config['WRF_domains']
-    grids = config['grids']
-    # target data specs
-    export_arguments = config['export_parameters'] # this is actually a larger data structure
-    lm3 = export_arguments['lm3'] # convert water flux from kg/m^2/s to m^3/m^2/s    
-  else:
-    # settings for testing and debugging
-    NP = 1 ; ldebug = False # for quick computations
-#     NP = 1 ; ldebug = True # just for tests
-#     modes = ('climatology',) # 'climatology','time-series'
-    modes = ('time-series',) # 'climatology','time-series'
-    loverwrite = True
-#     varlist = None
-    load_list = ['lat2D','lon2D','zs']
-    load_list += ['waterflx','liqprec','solprec','precip','evap','snwmlt'] # (net) precip
-    # PET variables
-    load_list += ['ps','U10','Q2','Tmin','Tmax','Tmean','TSmin','TSmax'] # wind
-    load_list += ['grdflx','A','SWD','e','GLW','SWDNB','SWUPB','LWDNB','LWUPB'] # radiation
-    periods = []
-    periods += [15]
-#     periods += [30]
-    # Observations/Reanalysis
-    resolutions = {'CRU':'','GPCC':'25','NARR':'','CFSR':'05'}
-    datasets = [] # this will generally not work, because we don't have snow/-melt...
-    lLTM = False # also regrid the long-term mean climatologies 
-#     datasets += ['GPCC','CRU']; #resolutions = {'GPCC':['05']}
-    # CESM experiments (short or long name) 
-    CESM_project = None # all available experiments
-    load3D = False
-    CESM_experiments = [] # use None to process all CESM experiments
-#     CESM_experiments += ['Ens']
-#     CESM_experiments += ['Ctrl-1', 'Ctrl-A', 'Ctrl-B', 'Ctrl-C']
-    CESM_filetypes = ['atm','lnd']
-    # WRF experiments (short or long name)
-    WRF_project = 'GreatLakes' # only GreatLakes experiments
-#     WRF_project = 'WesternCanada' # only WesternCanada experiments
-    WRF_experiments = [] # use None to process all WRF experiments
-#     WRF_experiments = ['erai-g','erai-t']
-#     WRF_experiments += ['g-ensemble','g-ensemble-2050','g-ensemble-2100']
-#     WRF_experiments += ['g-ctrl','g-ctrl-2050','g-ctrl-2100']
-#     WRF_experiments += ['new-v361-ctrl', 'new-v361-ctrl-2050', 'new-v361-ctrl-2100']
-#     WRF_experiments += ['erai-3km','max-3km']
-#     WRF_experiments += ['max-ctrl','max-ctrl-2050','max-ctrl-2100']
-#     WRF_experiments += ['max-ctrl-2050','max-ens-A-2050','max-ens-B-2050','max-ens-C-2050',]    
-    WRF_experiments += ['g-ctrl','g-ens-A','g-ens-B','g-ens-C',]
-    WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
-    WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
-#     WRF_experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',]
-    # other WRF parameters 
-#     domains = 2 # domains to be processed
-    domains = None # process all domains
-#     WRF_filetypes = ('hydro','srfc','xtrm','lsm','rad') # available input files
-    WRF_filetypes = ('hydro','srfc','xtrm','lsm') # without radiation files
-    # typically a specific grid is required
-    grids = [] # list of grids to process
-    grids += [None] # special keyword for native grid
-#     grids += ['grw2']# small grid for HGS GRW project
-#     grids += ['glb1_d02']# small grid for HGS GRW project
-    ## export parameters
-    export_arguments = dict(
-        project = 'GRW', # project designation  
-        varlist = ['waterflx','liqwatflx','lat2D','lon2D','zs','netrad','vapdef','pet'], # varlist for export                         
-#         folder = '{0:s}/HGS/{{0:s}}/{{1:s}}/{{2:s}}/{{3:s}}/'.format(os.getenv('DATA_ROOT', None)),
-#         prefix = '{0:s}_{1:s}_{2:s}_{3:s}', # argument order: project/grid/experiment/period/
-#         format = 'ASCII_raster', # formats to export to
-#         lm3 = True) # convert water flux from kg/m^2/s to m^3/m^2/s
-        format = 'NetCDF',
-        lm3 = False) # convert water flux from kg/m^2/s to m^3/m^2/s
-  
-  ## process arguments    
-  if isinstance(periods, (np.integer,int)): periods = [periods]
-  # check and expand WRF experiment list
-  WRF_experiments = getExperimentList(WRF_experiments, WRF_project, 'WRF')
-  if isinstance(domains, (np.integer,int)): domains = [domains]
-  # check and expand CESM experiment list
-  CESM_experiments = getExperimentList(CESM_experiments, CESM_project, 'CESM')
-  # expand datasets and resolutions
-  if datasets is None: datasets = gridded_datasets  
-  
-  # print an announcement
-  if len(WRF_experiments) > 0:
-    print('\n Exporting WRF Datasets:')
-    print([exp.name for exp in WRF_experiments])
-  if len(CESM_experiments) > 0:
-    print('\n Exporting CESM Datasets:')
-    print([exp.name for exp in CESM_experiments])
-  if len(datasets) > 0:
-    print('\n And Observational Datasets:')
-    print(datasets)
-  print('\n From Grid/Resolution:\n   {:s}'.format(printList(grids)))
-  print('To File Format {:s}'.format(export_arguments['format']))
-  print('\n Project Designation: {:s}'.format(export_arguments['project']))
-  print('Export Variable List: {:s}'.format(printList(export_arguments['varlist'])))
-  if export_arguments['lm3']: '\n Converting kg/m^2/s (mm/s) into m^3/m^2/s (m/s)'
-  print('\nOVERWRITE: {0:s}\n'.format(str(loverwrite)))
-  
-  # check formats (will be iterated over in export function, hence not part of task list)
-  if export_arguments['format'] == 'ASCII_raster':
-    print('Export Folder: {:s}'.format(export_arguments['folder']))
-    print('File Prefix: {:s}'.format(export_arguments['prefix']))
-  elif export_arguments['format'].lower() in ('netcdf','netcdf4'):
-    pass
-  else:
-    raise ArgumentError, "Unsupported file format: '{:s}'".format(export_arguments['format'])
+    ## read environment variables
+    # number of processes NP 
+    if os.environ.has_key('PYAVG_THREADS'): 
+      NP = int(os.environ['PYAVG_THREADS'])
+    else: NP = None
+    # run script in debug mode
+    if os.environ.has_key('PYAVG_DEBUG'): 
+      ldebug =  os.environ['PYAVG_DEBUG'] == 'DEBUG' 
+    else: ldebug = False
+    # run script in batch or interactive mode
+    if os.environ.has_key('PYAVG_BATCH'): 
+      lbatch =  os.environ['PYAVG_BATCH'] == 'BATCH' 
+    else: lbatch = False # for debugging
+    # re-compute everything or just update 
+    if os.environ.has_key('PYAVG_OVERWRITE'): 
+      loverwrite =  os.environ['PYAVG_OVERWRITE'] == 'OVERWRITE' 
+    else: loverwrite = ldebug # False means only update old files
     
-  ## construct argument list
-  args = []  # list of job packages
-  # loop over modes
-  for mode in modes:
-    # only climatology mode has periods    
-    if mode == 'climatology': periodlist = periods
-    elif mode == 'time-series': periodlist = (None,)
-    else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)
-
-    # loop over target grids ...
-    for grid in grids:
+    ## define settings
+    if lbatch:
+        # load YAML configuration
+        config = loadYAML('export.yaml', lfeedback=True)
+        # read config object
+        NP = NP or config['NP']
+        loverwrite = config['loverwrite']
+        # source data specs
+        modes = config['modes']
+        load_list = config['load_list']
+        periods = config['periods']
+        # Datasets
+        datasets = config['datasets']
+        resolutions = config['resolutions']
+        unity_grid = config.get('unity_grid',None)
+        lLTM = config['lLTM']
+        # CESM
+        CESM_project = config['CESM_project']
+        CESM_experiments = config['CESM_experiments']
+        CESM_filetypes = config['CESM_filetypes']
+        load3D = config['load3D']
+        # WRF
+        WRF_project = config['WRF_project']
+        WRF_experiments = config['WRF_experiments']
+        WRF_filetypes = config['WRF_filetypes']
+        domains = config['WRF_domains']
+        grids = config['grids']
+        # bias correction
+        bc_args = config.get('bias_correction',None) # missing parameters are inferred from experiment
+        if bc_args is not None:    
+            bc_method = bc_args.pop('method') # bias-correction method
+            obs_dataset = bc_args.pop('obs_dataset') # observations used for bias correction
+            bc_reference = bc_args.pop('reference',None) # reference experiment (None: auto-detect based on name)
+        else: bc_method = None # bc_method == None: no bias correction
+        # target data specs
+        export_arguments = config['export_parameters'] # this is actually a larger data structure
+    else:
+        # settings for testing and debugging
+        NP = 3; ldebug = False # for quick computations
+#         NP = 1 ; ldebug = True # just for tests
+#         modes = ('time-series','climatology')
+        modes = ('annual-mean','climatology',) # 'time-series'
+#         modes = ('climatology',)  
+#         modes = ('time-series',)  
+        loverwrite = True
+        exp_list= None
+        # obs variables
+#         load_list = ['lat2D','lon2D','liqwatflx','pet']
+        load_list = ['lat2D','lon2D','liqwatflx','pet','liqwatflx_CMC'] # 'precip',
+#         # WRF variables
+#         #load_list = ['pet_wrf']
+#         load_list = ['lat2D','lon2D','zs','snow','pet_wrf']
+#         load_list += ['waterflx','liqprec','solprec','precip','evap','snwmlt'] # (net) precip
+#         # PET variables (for WRF)
+#         load_list += ['ps','u10','v10','Q2','Tmin','Tmax','T2','TSmin','TSmax',] # wind
+#         load_list += ['grdflx','A','SWD','e','GLW','SWDNB','SWUPB','LWDNB','LWUPB'] # radiation
+        # WRF constants
+#         load_list= ['lat2D','lon2D','zs','landuse','landmask','LANDUSEF','vegcat','SHDMAX','SHDMIN',
+#                     'SOILHGT','soilcat','SOILCTOP','SOILCBOT','LAKE_DEPTH','SUNSHINE','MAPFAC_M'] # constants
+        # period list
+        periods = [] 
+#         periods += [15]
+        periods += [30]
+        # Observations/Reanalysis
+        resolutions = {'CRU':'','GPCC':['025','05','10','25'],'NARR':'','CFSR':['05','031'],'NRCan':'NA12'}
+        lLTM = False # also regrid the long-term mean climatologies 
+        datasets = []
+        datasets += ['NRCan']; periods = [(1980,2010),] # this will generally not work, because we don't have snow/-melt...
+        resolutions = {'NRCan': ['na12_ephemeral','na12_maritime','na12_prairies'][1:2]}
+    #     datasets += ['GPCC','CRU']; #resolutions = {'GPCC':['05']}
+        # CESM experiments (short or long name) 
+        CESM_project = None # all available experiments
+        load3D = False
+        CESM_experiments = [] # use None to process all CESM experiments
+    #     CESM_experiments += ['Ens']
+    #     CESM_experiments += ['Ctrl-1', 'Ctrl-A', 'Ctrl-B', 'Ctrl-C']
+        CESM_filetypes = ['atm','lnd']
+        # WRF experiments (short or long name)
+        WRF_project = 'GreatLakes'; unity_grid = 'glb1_d02' # only GreatLakes experiments
+#         WRF_project = 'WesternCanada'; unity_grid = 'arb2_d02' # only WesternCanada experiments
+        WRF_experiments = [] # use None to process all WRF experiments
+#         WRF_experiments += ['erai-g','erai-t','erai-g3','erai-t3',]
+#         WRF_experiments += ['g3-ensemble','g3-ensemble-2050','g3-ensemble-2100']
+#         WRF_experiments += ['t3-ensemble','t3-ensemble-2050','t3-ensemble-2100']
+#         WRF_experiments += ['g-ensemble','g-ensemble-2050','g-ensemble-2100']
+#         WRF_experiments += ['t-ensemble','t-ensemble-2050','t-ensemble-2100']
+#         WRF_experiments += ['t3-ensemble-2100','g3-ensemble-2100']
+#         WRF_experiments += ['t-ensemble',]
+#         WRF_experiments += ['g-ctrl','g-ctrl-2050','g-ctrl-2100']
+#         WRF_experiments += ['t-ctrl','t-ctrl-2050','t-ctrl-2100']
+#         WRF_experiments += ['new-v361-ctrl', 'new-v361-ctrl-2050', 'new-v361-ctrl-2100']
+#         WRF_experiments += ['erai-3km','max-3km']
+#         WRF_experiments += ['max-ctrl','max-ctrl-2050','max-ctrl-2100']
+#         WRF_experiments += ['max-ensemble','max-ensemble-2050','max-ensemble-2100']
+#         WRF_experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',]
+#         WRF_experiments += ['max-ctrl-2050','max-ens-A-2050','max-ens-B-2050','max-ens-C-2050',]    
+#         WRF_experiments += ['max-ctrl-2100','max-ens-A-2100','max-ens-B-2100','max-ens-C-2100',]    
+#         WRF_experiments += ['g3-ctrl',     'g3-ens-A',     'g3-ens-B',     'g3-ens-C',]
+#         WRF_experiments += ['g3-ctrl-2050','g3-ens-A-2050','g3-ens-B-2050','g3-ens-C-2050',]
+#         WRF_experiments += ['g3-ctrl-2100','g3-ens-A-2100','g3-ens-B-2100','g3-ens-C-2100',]
+#         WRF_experiments += ['t3-ctrl',     't3-ens-A',     't3-ens-B',     't3-ens-C',]
+#         WRF_experiments += ['t3-ctrl-2050','t3-ens-A-2050','t3-ens-B-2050','t3-ens-C-2050',]
+#         WRF_experiments += ['t3-ctrl-2100','t3-ens-A-2100','t3-ens-B-2100','t3-ens-C-2100',]
+#         WRF_experiments += ['g-ctrl',     'g-ens-A',     'g-ens-B',     'g-ens-C',]  # bc_reference = 'g-ensemble'
+#         WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
+#         WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
+#         WRF_experiments += ['t-ctrl',     't-ens-A',     't-ens-B',     't-ens-C',] # bc_reference = 't-ensemble'
+#         WRF_experiments += ['t-ctrl-2050','t-ens-A-2050','t-ens-B-2050','t-ens-C-2050',]
+#         WRF_experiments += ['t-ctrl-2100','t-ens-A-2100','t-ens-B-2100','t-ens-C-2100',]
+        # other WRF parameters 
+#         domains = 2 # domains to be processed
+        domains = 1 # domains to be processed
+#         domains = None # process all domains
+        WRF_filetypes = ('hydro','srfc','xtrm','lsm','rad') # available input files
+#         WRF_filetypes = ('const',) # with radiation files
+        ## bias-correction paramter
+        bc_method = None; bc_tag = '' # no bias correction
+#         bc_method = 'AABC'; bc_tag = bc_method+'_' # bias correction method (None: no bias correction)        
+#         obs_dataset = 'NRCan' # the observational dataset 
+#         bc_reference = None # reference experiment (None: auto-detect based on name)
+#         bc_reference = 't-ensemble'
+        bc_varmap = dict(Tmin=('Tmin','TSmin'), Tmax=('Tmax','TSmax'), T2=('T2','Tmean'), pet_wrf=('pet_wrf','evap'), 
+                         SWDNB=('SWDNB','SWUPB','SWD'),SWD=('SWDNB','SWUPB','SWD'),)
+        bc_args = dict(grid=None, domain=None, lgzip=True, varmap=bc_varmap) # missing/None parameters are inferred from experiment
+        ## export to ASCII raster
+        # typically a specific grid is required
+        grids = [] # list of grids to process
+#         grids += [None]; project = None # special keyword for native grid
+#         grids += ['grw2']; project = 'GRW' # small grid for GRW project
+#         grids += ['asb1']; project = 'ASB' # main grid for ASB project
+#         grids += ['brd1']; project = 'ASB' # small grid for ASB project
+#         grids += ['can1']; project = 'CAN' # large Canada-wide grid
+        grids += ['snw1']; project = 'SNW' # south nation watershed
+        export_arguments = dict(
+            # NRCan
+#             prefix = None, # based on keyword arguments or None
+            folder = '{0:s}/{{PROJECT}}/{{GRID}}/{{EXPERIMENT}}/{{PERIOD}}/climate_forcing/'.format(os.getenv('HGS_ROOT', None)),
+            compute_list = [], exp_list= ['lat2D','lon2D','liqwatflx','pet','liqwatflx_CMC',], # varlist for NRCan
+            # WRF
+#             exp_list= ['landuse','landmask'],
+#             exp_list= ['lat2D','lon2D','zs','LU_MASK','LU_INDEX','LANDUSEF','VEGCAT','SHDMAX','SHDMIN',
+#                        'SOILHGT','SOILCAT','SOILCTOP','SOILCBOT','LAKE_DEPTH','SUNSHINE','MAPFAC_M'], # constants
+#             compute_list = ['waterflx','liqwatflx','pet'], # variables that should be (re-)computed
+#             exp_list= ['lat2D','lon2D','zs','waterflx','liqwatflx','pet','pet_wrf'], # varlist for export
+#             compute_list = ['liqwatflx',], exp_list= ['lat2D','lon2D','zs','liqwatflx','pet_wrf'], # short varlist for quick export
+#             exp_list= ['pet_wrf'], compute_list = [], # varlist for export
+#             exp_list = load_list, # varlist for Obs is same as load_list
+#             folder = '{0:s}/{{PROJECT}}/{{GRID}}/{{EXPERIMENT}}/{{BIAS}}_{{PERIOD}}/climate_forcing/'.format(os.getenv('HGS_ROOT')),
+#             folder = '//AQFS1/Data/temp_data_exchange/{PROJECT}/{GRID}/{EXPERIMENT}/{PERIOD}/climate_forcing/',
+#             folder = '{0:s}/{{PROJECT}}/{{GRID}}/{{EXPERIMENT}}/land_data/'.format(os.getenv('HGS_ROOT')),
+#             folder = '//AQFS1/Data/temp_data_exchange/{PROJECT}/{GRID}/{EXPERIMENT}/land_data/',
+            # common
+            project = project, # project designation  
+            prefix = '{GRID}', # based on keyword arguments
+            format = 'ASCII_raster', # formats to export to
+            fillValue = 0, noDataValue = -9999, # in case we interpolate across a missing value...
+            lm3 = True) # convert water flux from kg/m^2/s to m^3/m^2/s
+        ## export to NetCDF (aux-file)
+#         grids = [None] # special keyword for native grid
+# #         grids = ['grw2'] # GRW main grid
+#         exp_list = ['netrad','netrad_bb0','netrad_bb','vapdef','pet','pet_wrf','petrad','petwnd']
+#         exp_list += ['Tmin','Tmax','T2','Tmean','TSmin','TSmax','SWD','SWDNB','SWUPB','zs','lat2D','lon2D',]
+#         exp_list += ['waterflx','liqwatflx','liqprec','solprec','precip','snow','snowh','snwmlt',]
+#         compute_list = ['waterflx','liqwatflx','pet'] # variables that should be (re-)computed
+#         export_arguments = dict( format = 'NetCDF',
+#             exp_list= exp_list, compute_list=compute_list, 
+#             project = bc_method if bc_method else 'AUX',
+#             filetype = bc_method.lower() if bc_method else 'aux',
+#             lm3 = False) # do not convert water flux from kg/m^2/s to m^3/m^2/s
       
-        # observational datasets (grid depends on dataset!)
-        for dataset in datasets:
-          mod = import_module('datasets.{0:s}'.format(dataset))
-          if isinstance(resolutions,dict): 
-            if dataset not in resolutions: resolutions[dataset] = ('',)
-            elif not isinstance(resolutions[dataset],(list,tuple)): resolutions[dataset] = (resolutions[dataset],)                
-          elif resolutions is not None: raise TypeError                                
-          if mode == 'climatology':
-            # some datasets come with a climatology 
-            if lLTM:
-              if resolutions is None: dsreses = mod.LTM_grids
-              elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.LTM_grids]  
-              for dsres in dsreses: 
-                args.append( (dataset, mode, dict(grid=grid, varlist=load_list, period=None, resolution=dsres)) ) # append to list
-            # climatologies derived from time-series
-            if resolutions is None: dsreses = mod.TS_grids
-            elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
-            for dsres in dsreses:
-              for period in periodlist:
-                args.append( (dataset, mode, dict(grid=grid, varlist=load_list, period=period, resolution=dsres)) ) # append to list            
-          elif mode == 'time-series': 
-            # regrid the entire time-series
-            if resolutions is None: dsreses = mod.TS_grids
-            elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
-            for dsres in dsreses:
-              args.append( (dataset, mode, dict(grid=grid, varlist=load_list, period=None, resolution=dsres)) ) # append to list            
+    ## process arguments    
+    if isinstance(periods, (np.integer,int)): periods = [periods]
+    # check and expand WRF experiment list
+    WRF_experiments = getExperimentList(WRF_experiments, WRF_project, 'WRF')
+    if isinstance(domains, (np.integer,int)): domains = [domains]
+    # check and expand CESM experiment list
+    CESM_experiments = getExperimentList(CESM_experiments, CESM_project, 'CESM')
+    # expand datasets and resolutions
+    if datasets is None: datasets = gridded_datasets  
+    if unity_grid is None and 'Unity' in datasets:
+      if WRF_project: unity_grid = import_module('projects.{:s}'.format(WRF_project)).unity_grid
+      else: raise DatasetError("Dataset 'Unity' has no native grid - please set 'unity_grid'.") 
+  
+    # print an announcement
+    if len(WRF_experiments) > 0:
+      print('\n Exporting WRF Datasets:')
+      print([exp.name for exp in WRF_experiments])
+    if len(CESM_experiments) > 0:
+      print('\n Exporting CESM Datasets:')
+      print([exp.name for exp in CESM_experiments])
+    if len(datasets) > 0:
+      print('\n And Observational Datasets:')
+      print(datasets)
+    print('\n From Grid/Resolution:\n   {:s}'.format(printList(grids)))
+    print('To File Format {:s}'.format(export_arguments['format']))
+    print('\n Project Designation: {:s}'.format(export_arguments['project']))
+    if bc_method:
+      print('\n And Observational Datasets:')
+      print(datasets)
+    print('Export Variable List: {:s}'.format(printList(export_arguments['exp_list'])))
+    if export_arguments['lm3']: '\n Converting kg/m^2/s (mm/s) into m^3/m^2/s (m/s)'
+    # check formats (will be iterated over in export function, hence not part of task list)
+    if export_arguments['format'] == 'ASCII_raster':
+      print('Export Folder: {:s}'.format(export_arguments['folder']))
+      print('File Prefix: {:s}'.format(export_arguments['prefix']))
+    elif export_arguments['format'].lower() in ('netcdf','netcdf4'):
+      pass
+    else:
+      raise ArgumentError, "Unsupported file format: '{:s}'".format(export_arguments['format'])
+    print('\nOVERWRITE: {0:s}'.format(str(loverwrite)))
+    # bias-correction parameters (if used)
+    print('\nBias-Correction: {}'.format(bc_method))
+    if bc_method:
+      print('  Observational Dataset: {:s}'.format(obs_dataset))
+      print('  Reference Dataset: {:s}'.format(bc_reference))
+      print('  Parameters: {}'.format(bc_args))
+    print('\n') # separator space
+      
+    ## construct argument list
+    args = []  # list of job packages
+    # loop over modes
+    for mode in modes:
+      # only climatology mode has periods    
+      if mode[-5:] == '-mean': periodlist = periods
+      elif mode == 'climatology': periodlist = periods
+      elif mode == 'time-series': periodlist = (None,)
+      else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)
+  
+      # loop over target grids ...
+      for grid in grids:
         
-        # CESM datasets
-        for experiment in CESM_experiments:
-          for period in periodlist:
-            # arguments for worker function: dataset and dataargs       
-            args.append( ('CESM', mode, dict(experiment=experiment, filetypes=CESM_filetypes, grid=grid, 
-                                             varlist=load_list, period=period, load3D=load3D)) )
-        # WRF datasets
-        for experiment in WRF_experiments:
-          # effectively, loop over domains
-          if domains is None:
-            tmpdom = range(1,experiment.domains+1)
-          else: tmpdom = domains
-          for domain in tmpdom:
+          # observational datasets (grid depends on dataset!)
+          for dataset in datasets:
+            mod = import_module('datasets.{0:s}'.format(dataset))
+            if isinstance(resolutions,dict): 
+              if dataset not in resolutions: resolutions[dataset] = ('',)
+              elif not isinstance(resolutions[dataset],(list,tuple)): resolutions[dataset] = (resolutions[dataset],)                
+            elif resolutions is not None: raise TypeError                                
+            if mode[-5:] == '-mean' or mode == 'climatology':
+              # some datasets come with a climatology 
+              if lLTM:
+                if resolutions is None: dsreses = mod.LTM_grids
+                elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.LTM_grids]  
+                for dsres in dsreses: 
+                  args.append( (dataset, mode, dict(grid=grid, varlist=load_list, period=None, resolution=dsres, unity_grid=unity_grid)) ) # append to list
+              # climatologies derived from time-series
+              if resolutions is None: dsreses = mod.TS_grids
+              elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
+              for dsres in dsreses:
+                for period in periodlist:
+                  args.append( (dataset, mode, dict(grid=grid, varlist=load_list, period=period, resolution=dsres, unity_grid=unity_grid)) ) # append to list            
+            elif mode == 'time-series': 
+              # regrid the entire time-series
+              if resolutions is None: dsreses = mod.TS_grids
+              elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
+              for dsres in dsreses:
+                args.append( (dataset, mode, dict(grid=grid, varlist=load_list, period=None, resolution=dsres, unity_grid=unity_grid)) ) # append to list            
+          
+          # CESM datasets
+          for experiment in CESM_experiments:
             for period in periodlist:
               # arguments for worker function: dataset and dataargs       
-              args.append( ('WRF', mode, dict(experiment=experiment, filetypes=WRF_filetypes, grid=grid, 
-                                              varlist=load_list, domain=domain, period=period)) )
-      
-  # static keyword arguments
-  kwargs = dict(expargs=export_arguments, loverwrite=loverwrite)
-  # N.B.: formats will be iterated over inside export function
-  
-  ## call parallel execution function
-  ec = asyncPoolEC(performExport, args, kwargs, NP=NP, ldebug=ldebug, ltrialnerror=True)
-  # exit with fraction of failures (out of 10) as exit code
-  exit(int(10+int(10.*ec/len(args))) if ec > 0 else 0)
+              args.append( ('CESM', mode, dict(experiment=experiment, filetypes=CESM_filetypes, grid=grid, 
+                                               varlist=load_list, period=period, load3D=load3D)) )
+          # WRF datasets
+          for experiment in WRF_experiments:
+            # effectively, loop over domains
+            if domains is None:
+              tmpdom = range(1,experiment.domains+1)
+            else: tmpdom = domains
+            for domain in tmpdom:
+              for period in periodlist:
+                # arguments for worker function: dataset and dataargs       
+                args.append( ('WRF', mode, dict(experiment=experiment, filetypes=WRF_filetypes, grid=grid, 
+                                                varlist=load_list, domain=domain, period=period)) )
+    
+    # put bias correction arguments into a single dict
+    if bc_method:
+        bc_args['method'] = bc_method
+        bc_args['obs_dataset'] = obs_dataset 
+        bc_args['reference'] = bc_reference
+    else:
+        bc_args = None
+    # static keyword arguments
+    kwargs = dict(expargs=export_arguments, bcargs=bc_args, loverwrite=loverwrite, )
+    # N.B.: formats will be iterated over inside export function
+    
+    ## call parallel execution function
+    ec = asyncPoolEC(performExport, args, kwargs, NP=NP, ldebug=ldebug, ltrialnerror=True)
+    # exit with fraction of failures (out of 10) as exit code
+    exit(int(10+int(10.*ec/len(args))) if ec > 0 else 0)

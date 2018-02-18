@@ -8,20 +8,24 @@ This module contains common meta data and access functions for CESM model output
 
 # external imports
 import numpy as np
-import os, pickle
+import os
+try: import cPickle as pickle
+except: import pickle
+
 # from atmdyn.properties import variablePlotatts
 from geodata.base import Variable, Axis, concatDatasets, monthlyUnitsList
 from geodata.netcdf import DatasetNetCDF, VarNC
 from geodata.gdal import addGDALtoDataset, GDALError
 from geodata.misc import DatasetError, AxisError, DateError, ArgumentError, isNumber, isInt
-from datasets.common import ( translateVarNames, data_root, grid_folder, default_varatts, 
-                              addLengthAndNamesOfMonth, selectElements, stn_params, shp_params )
-from geodata.gdal import loadPickledGridDef, griddef_pickle
+from datasets.common import translateVarNames, grid_folder, default_varatts, getRootFolder
+from datasets.common import addLengthAndNamesOfMonth, selectElements, stn_params, shp_params
+from geodata.gdal import loadPickledGridDef, pickleGridDef
 from datasets.WRF import Exp as WRF_Exp
 from processing.process import CentralProcessingUnit
 
 # some meta data (needed for defaults)
-root_folder = data_root + '/CESM/' # long-term mean folder
+dataset_name = 'CESM' # dataset name
+root_folder = getRootFolder(dataset_name=dataset_name, fallback_name='WRF')
 outfolder = root_folder + 'cesmout/' # WRF output folder
 avgfolder = root_folder + 'cesmavg/' # monthly averages and climatologies
 cvdpfolder = root_folder + 'cvdp/' # CVDP output (netcdf files and HTML tree)
@@ -104,15 +108,22 @@ def flipLon(data, flip=144, lrev=False, var=None, slc=None):
 
 
 ## variable attributes and name
+# a generic class for CESM file types
 class FileType(object): 
-  ''' Container class for all attributes of of the constants files. '''
-  atts = NotImplemented
-  vars = NotImplemented
-  climfile = None
-  tsfile = None
-  cvdpfile = None
-  diagfile = None
-  
+  ''' A generic class that describes CESM file types. '''
+  def __init__(self, *args, **kwargs):
+    ''' generate generic attributes using a name argument '''
+    if len(args) == 1: 
+      name = args[0]
+      self.name = name
+      self.atts = dict() # should be properly formatted already
+      #self.atts = dict(netrad = dict(name='netrad', units='W/m^2'))
+      self.vars = []    
+      self.climfile = 'cesm{:s}{{0:s}}_clim{{1:s}}.nc'.format(name) # generic climatology name 
+      # final filename needs to be extended by ('_'+grid,'_'+period)
+      self.tsfile = 'cesm{:s}{{0:s}}_monthly.nc'.format(name) # generic time-series name
+      # final filename needs to be extended by ('_'+grid,)
+    else: raise ArgumentError  
 # surface variables
 class ATM(FileType):
   ''' Variables and attributes of the surface files. '''
@@ -152,9 +163,12 @@ class ATM(FileType):
                      SHFLX    = dict(name='hfx', units='W/m^2'), # surface sensible heat flux
                      LHFLX    = dict(name='lhfx', units='W/m^2'), # surface latent heat flux
                      QFLX     = dict(name='evap', units='kg/m^2/s'), # surface evaporation
-                     FLUT     = dict(name='OLR', units='W/m^2'), # Outgoing Longwave Radiation
-                     FLDS     = dict(name='GLW', units='W/m^2'), # Ground Longwave Radiation
-                     FSDS     = dict(name='SWD', units='W/m^2'), # Downwelling Shortwave Radiation                     
+                     FLUT     = dict(name='LWUPT', units='W/m^2'), # Outgoing Longwave Radiation
+                     FLDS     = dict(name='LWDNB', units='W/m^2'), # Ground Longwave Radiation
+                     FSDS     = dict(name='SWDNB', units='W/m^2'), # Downwelling Shortwave Radiation                     
+                     OLR      = dict(name='LWUPT', units='W/m^2'), # Outgoing Longwave Radiation
+                     GLW      = dict(name='LWDNB', units='W/m^2'), # Ground Longwave Radiation
+                     SWD      = dict(name='SWDNB', units='W/m^2'), # Downwelling Shortwave Radiation                     
                      PS       = dict(name='ps', units='Pa'), # surface pressure
                      PSL      = dict(name='pmsl', units='Pa'), # mean sea level pressure
                      PHIS     = dict(name='zs', units='m', scalefactor=1./9.81), # surface elevation
@@ -175,6 +189,7 @@ class LND(FileType):
                      QOVER    = dict(name='sfroff', units='kg/m^2/s'), # surface run-off
                      QRUNOFF  = dict(name='runoff', units='kg/m^2/s'), # total surface and sub-surface run-off
                      QIRRIG   = dict(name='irrigation', units='kg/m^2/s'), # water flux through irrigation
+                     H2OSOI   = dict(name='aSM', units='m^3/m^3'), # absolute soil moisture
                      )
     self.vars = self.atts.keys()    
     self.climfile = 'cesmlnd{0:s}_clim{1:s}.nc' # the filename needs to be extended by ('_'+grid,'_'+period)
@@ -233,9 +248,11 @@ class Axes(FileType):
                      lat           = dict(name='lat', units='deg N'), # south-north coordinate
                      LON           = dict(name='lon', units='deg E'), # west-east coordinate (actually identical to lon!)
                      LAT           = dict(name='lat', units='deg N'), # south-north coordinate (actually identical to lat!)                     
-                     levgrnd = dict(name='s', units=''), # soil layers
+                     levgrnd       = dict(name='s', units=''), # soil layers
                      lev = dict(name='lev', units='')) # hybrid pressure coordinate
     self.vars = self.atts.keys()
+    self.climfile = None
+    self.tsfile = None
 
 # data source/location
 fileclasses = dict(atm=ATM(), lnd=LND(), axes=Axes(), cvdp=CVDP()) # ice=ICE() is currently not supported because of the grid
@@ -403,7 +420,6 @@ def loadCESM_All(experiment=None, name=None, grid=None, station=None, shape=None
   # handle stations and shapes
   if station and shape: raise ArgumentError
   elif station or shape: 
-    if grid is not None: raise NotImplementedError, 'Currently CESM station data can only be loaded from the native grid.'
     if lcvdp: raise NotImplementedError, 'CVDP data is not available as station data.'
     if lautoregrid: raise GDALError, 'Station data can not be regridded, since it is not map data.'   
     lstation = bool(station); lshape = bool(shape)
@@ -444,7 +460,7 @@ def loadCESM_All(experiment=None, name=None, grid=None, station=None, shape=None
   else: raise TypeError  
   atts = dict(); filelist = []; typelist = []
   for filetype in filetypes:
-    fileclass = fileclasses[filetype]
+    fileclass = fileclasses[filetype] if filetype in fileclasses else FileType(filetype)
     if lclim and fileclass.climfile is not None: filelist.append(fileclass.climfile)
     elif lts and fileclass.tsfile is not None: filelist.append(fileclass.tsfile)
     elif lcvdp and fileclass.cvdpfile is not None: filelist.append(fileclass.cvdpfile)
@@ -472,14 +488,12 @@ def loadCESM_All(experiment=None, name=None, grid=None, station=None, shape=None
   # NetCDF file mode
   ncmode = 'rw' if lwrite else 'r'   
   # get grid or station-set name
-  if lstation:
-    # the station name can be inserted as the grid name
-    gridstr = '_'+station.lower(); # only use lower case for filenames
+  if lstation or lshape:
+    # the station or shape name can be inserted as the grid name
+    if lstation: gridstr = '_'+station.lower(); # only use lower case for filenames
+    elif lshape: gridstr = '_'+shape.lower(); # only use lower case for filenames
     griddef = None
-  elif lshape:
-    # the station name can be inserted as the grid name
-    gridstr = '_'+shape.lower(); # only use lower case for filenames
-    griddef = None
+    if grid and grid != experiment.grid: gridstr += '_'+grid.lower(); # only use lower case for filenames
   else:
     if grid is None or grid == experiment.grid: 
       gridstr = ''; griddef = None
@@ -669,7 +683,7 @@ def loadCESM_Ensemble(ensemble=None, name=None, title=None, grid=None, station=N
 
 ## Dataset API
 
-dataset_name = 'CESM' # dataset name
+dataset_name # dataset name
 root_folder # root folder of the dataset
 avgfolder # root folder for monthly averages
 outfolder # root folder for direct WRF output
@@ -731,13 +745,9 @@ if __name__ == '__main__':
       griddef.name = grid
       print('   Loading Definition from \'{0:s}\''.format(dataset.name))
       # save pickle
-      filename = '{0:s}/{1:s}'.format(grid_folder,griddef_pickle.format(grid))
-      if os.path.exists(filename): os.remove(filename) # overwrite
-      filehandle = open(filename, 'w')
-      pickle.dump(griddef, filehandle)
-      filehandle.close()
+      filepath = pickleGridDef(griddef, lfeedback=True, loverwrite=True, lgzip=True)
       
-      print('   Saving Pickle to \'{0:s}\''.format(filename))
+      print('   Saving Pickle to \'{0:s}\''.format(filepath))
       print('')
       
       # load pickle to make sure it is right

@@ -125,7 +125,8 @@ def add_coord(dst, name, data=None, length=None, atts=None, dtype=None, zlib=Tru
                   zlib=zlib, fillValue=fillValue, **kwargs)  
   return coord
 
-def add_var(dst, name, dims, data=None, shape=None, atts=None, dtype=None, zlib=True, fillValue=None, **kwargs):
+def add_var(dst, name, dims, data=None, shape=None, atts=None, dtype=None, zlib=True, fillValue=None, 
+            lusestr=True, **kwargs):
   ''' Function to add a Variable to a NetCDF Dataset; returns the Variable reference. '''
   # all remaining kwargs are passed on to dst.createVariable()
   # use data array to infer dimensions and data type
@@ -143,7 +144,7 @@ def add_var(dst, name, dims, data=None, shape=None, atts=None, dtype=None, zlib=
   if dtype is None: raise NCDataError, "Cannot construct a NetCDF Variable without a data array or an abstract data type."
   dtype = np.dtype(dtype) # use numpy types
   if dtype is np.dtype('bool_'): dtype = np.dtype('i1') # cast numpy bools as 8-bit integers
-  lstrvar = dtype.kind == 'S'
+  lstrvar = ( dtype.kind == 'S' and not lusestr )
   # check/create dimensions
   if shape is None: shape = [None,]*len(dims)
   else: shape = list(shape)
@@ -270,15 +271,16 @@ def writeNetCDF(dataset, ncfile, ncformat='NETCDF4', zlib=True, writeData=True, 
   #if ncfile.mode == 'r': raise NCDataError, "Need write permission on NetCDF dataset."
   ncfile.setncatts(coerceAtts(dataset.atts))
   # add coordinate variables first
-  for name,ax in dataset.axes.iteritems():
+  for name,ax in dataset.axes.items():
     # only need to add real coordinate axes; simple dimensions are added on-the-fly by ariables
     data = ax.getArray(unmask=True) if writeData and ( ax.data or not skipUnloaded ) else None
     add_coord(ncfile, name, length=len(ax), data=data, atts=coerceAtts(ax.atts), dtype=ax.dtype, zlib=zlib, fillValue=ax.fillValue)
   # now add variables
-  for name,var in dataset.variables.iteritems():
+  for name,var in dataset.variables.items():
     dims = tuple([ax.name for ax in var.axes])
-    data = var.getArray(unmask=True) if writeData and ( var.data or not skipUnloaded ) else None  
-    add_var(ncfile, name, dims=dims, data=data, atts=coerceAtts(var.atts), dtype=var.dtype, zlib=zlib, fillValue=var.fillValue)
+    #data = var.getArray(unmask=True) if writeData and ( var.data or not skipUnloaded ) else None  
+    add_var(ncfile, name, dims=dims, data=var.data_array, atts=coerceAtts(var.atts), 
+            dtype=var.dtype, zlib=zlib, fillValue=var.fillValue)
   # close file or return file handle
   ncfile.sync()
   if close: ncfile.close()

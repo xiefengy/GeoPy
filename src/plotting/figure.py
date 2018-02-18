@@ -14,11 +14,11 @@ from mpl_toolkits.axes_grid.axes_divider import LocatableAxes
 import numpy as np
 # internal imports
 from geodata.misc import isInt , ArgumentError
-from plotting.axes import MyAxes, MyLocatableAxes, Axes
+from plotting.axes import MyAxes, MyLocatableAxes, Axes, MyPolarAxes, TaylorAxes
 from plotting.misc import loadStyleSheet, toGGcolors
 import matplotlib as mpl
 # just for convenience
-from matplotlib.pyplot import show
+from matplotlib.pyplot import show, figure
 
 ## my new figure class
 class MyFigure(Figure):
@@ -28,9 +28,9 @@ class MyFigure(Figure):
     (This class does not support built-in projections; use the Basemap functionality instead.)  
   '''
   # some default parameters
-  title_height    = 0.06
-  title_size      = 'large'
-  print_setings   = None
+  title_height    = 0.05
+  title_size      = 'x-large'
+  print_settings  = None
   shared_legend   = None
   legend_axes     = None
   shared_colorbar = None
@@ -41,19 +41,23 @@ class MyFigure(Figure):
     # parse arguments
     if 'axes_class' in kwargs:
       axes_class = kwargs.pop('axes_class')
-      if not issubclass(axes_class, Axes): raise TypeError
+      if not issubclass(axes_class, Axes): raise TypeError(axes_class)
     else: axes_class = MyAxes # default
     if 'axes_args' in kwargs:
       axes_args = kwargs.pop('axes_args')
       if axes_args is not None and not isinstance(axes_args, dict): raise TypeError
     else: axes_args = None # default
+    if 'print_settings' in kwargs:
+      print_settings = kwargs.pop('print_settings')
+    else: print_settings = None
     # call parent constructor
     super(MyFigure,self).__init__(*args, **kwargs)
     # save axes class for later
     self.axes_class = axes_class   
     self.axes_args = axes_args 
-    # default print options
-    self.print_setings = dict(dpi=300, transparent=False)
+    # print options
+    self.print_settings = dict(dpi=300, transparent=False) # defaults
+    if print_settings: self.print_settings.update(print_settings)
     
 # N.B.: using the built-in mechanism to choose Axes seems to cause more problems
 #     from matplotlib.projections import register_projection
@@ -87,7 +91,8 @@ class MyFigure(Figure):
       #       if 'projection' not in kwargs: kwargs['projection'] = 'my'
       #       axes_class, kwargs, key = process_projection_requirements(
       #           self, *args, **kwargs)
-      axes_class = self.axes_class # defaults to my new custom axes (MyAxes)
+      axes_class = kwargs.pop('axes_class',None)  
+      if axes_class is None: axes_class = self.axes_class # defaults to my new custom axes (MyAxes)
       key = self._make_key(*args, **kwargs)
       # check that an axes of this type doesn't already exist, if it
       # does, set it as active and return it
@@ -123,8 +128,9 @@ class MyFigure(Figure):
     else:
       #       if 'projection' not in kwargs: kwargs['projection'] = 'my'
       #       axes_class, kwargs, key = process_projection_requirements(
-      #           self, *args, **kwargs)      
-      axes_class = self.axes_class # defaults to my new custom axes (MyAxes)
+      #           self, *args, **kwargs)    
+      axes_class = kwargs.pop('axes_class',None)  
+      if axes_class is None: axes_class = self.axes_class # defaults to my new custom axes (MyAxes)
       key = self._make_key(*args, **kwargs)
       # try to find the axes with this key in the stack
       ax = self._axstack.get(key)
@@ -175,25 +181,33 @@ class MyFigure(Figure):
       ax.updateAxes(mode='adjust')
         
   # add common/shared legend to a multi-panel plot
-  def addSharedLegend(self, plots=None, labels=None, fontsize=None, hscl=1., hpad=0.005, **kwargs):
+  def addSharedLegend(self, plots=None, labels=None, fontsize=None, hscl=1., hpad=0.005, location='bottom', loc=None, ncols=None, **kwargs):
     ''' add a common/shared legend to a multi-panel plot '''
     # complete input
-    if labels is None: labels = [plt.get_label() for plt in plots]
+    if labels is None: labels = [None if plt is None else plt.get_label() for plt in plots ]
     elif not isinstance(labels, (list,tuple)): raise TypeError
     if plots is None: plots = self.axes[0].plots
     elif not isinstance(plots, (list,tuple,NoneType)): raise TypeError
     # figure out fontsize and row numbers  
     fontsize = fontsize or self.axes[0].get_yaxis().get_label().get_fontsize() # or fig._suptitle.get_fontsize()
     nlen = len(plots) if plots else len(labels)
-    if fontsize > 11: ncols = 2 if nlen == 4 else 3
-    else: ncols = 3 if nlen == 6 else 4              
+    if ncols is None:
+        if fontsize > 11: ncols = 2 if nlen == 4 else 3
+        else: ncols = 3 if nlen == 6 else 4              
     # make room for legend
-    leghgt = ( np.ceil(float(nlen)/float(ncols)) * fontsize/300.) * hscl
-    self.updateSubplots(mode='shift', bottom=leghgt+hpad) # shift bottom upwards (add height pad)
-    ax = self.add_axes([0, -0.005, 1,leghgt]) # new axes to hold legend, with some attributes
+    if location.lower() == 'bottom':
+        leghgt = ( np.ceil(float(nlen)/float(ncols)) * fontsize/300.) * hscl
+        self.updateSubplots(mode='shift', bottom=leghgt+hpad) # shift bottom upwards (add height pad)
+        ax = self.add_axes([0, hpad-0.005, 1,leghgt-hpad], axes_class=MyAxes) # new axes to hold legend, with some attributes
+        if loc is None: loc = 9 
+    elif location.lower() == 'right':
+        leghgt = ( ncols * fontsize/40.) * hscl
+        self.updateSubplots(mode='shift', right=-leghgt-hpad) # shift bottom upwards (add height pad)
+        ax = self.add_axes([0.99-leghgt-hpad, 0, leghgt+hpad,1-self.title_height-hpad], axes_class=MyAxes) # new axes to hold legend, with some attributes
+        if loc is None: loc = 2 # upper left
     ax.set_frame_on(False); ax.axes.get_yaxis().set_visible(False); ax.axes.get_xaxis().set_visible(False)
     # define legend parameters
-    legargs = dict(loc=10, ncol=ncols, borderaxespad=0., fontsize=fontsize, frameon=True,
+    legargs = dict(loc=loc, ncol=ncols, borderaxespad=0., fontsize=fontsize, frameon=True,
                    labelspacing=0.1, handlelength=1.3, handletextpad=0.3, fancybox=True)
     legargs.update(kwargs)
     # create legend and return handle
@@ -239,36 +253,53 @@ class MyFigure(Figure):
     # get option
     folder = kwargs.pop('folder', None)
     lfeedback = kwargs.pop('lfeedback', None) or kwargs.pop('feedback', None)
+    lreplaceSpace = kwargs.pop('lreplaceSpace', True) and kwargs.pop('lreplaceSpace', True)
     filetype = kwargs.pop('filetype', 'pdf')
-    if not filetype.startswith('.'): filetype = '.'+filetype
+    lword = kwargs.pop('lword', True) # also produce M$ Word compatible filetype (mainly EPS version of PDFs) 
     # construct filename
-    filename = ''
+    basename = ''
     for arg in args: 
       if arg is not None:
         if isinstance(arg, (list,tuple)):
-          for a in arg: filename += str(a)
-        else: filename += str(arg)
-        filename += '_'
-    filename = filename[:-1] # remove last underscore
-    if not filename.endswith(filetype): filename += filetype
+          for a in arg: basename += str(a)
+        else: basename += str(arg)
+        basename += '_'
+    basename = basename[:-1] # remove last underscore
+    # replace spaces, if desired
+    if lreplaceSpace:
+        basename = basename.replace(' ', '_')
+    # add filename extension
+    filename = '{}.{}'.format(basename,filetype)
     # update print settings
-    sf = self.print_setings.copy() # print properties
+    sf = self.print_settings.copy() # print properties
     sf.update(kwargs) # update with kwargs
     # save file
-    if lfeedback: print('Saving figure in '+filename)
-    if folder is not None:
+    if lfeedback: print("Saving figure as '{:s}'".format(filename))
+    if folder:
       filename = '{:s}/{:s}'.format(folder,filename)
       if lfeedback: print("('{:s}')".format(folder))
     self.savefig(filename, **sf) # save figure to pdf
+    # save M$ Word compatible file version
+    if lword:
+        # determine alternative filetype
+        alttype = None
+        if filetype.lower() in ('pdf','eps','svg'): alttype = 'png'
+        # save alternative format
+        if alttype:
+            altname = '{}.{}'.format(basename,alttype)
+            if lfeedback: print("(Saving alternate format as '{:s}')".format(altname))
+            if folder: altname = '{:s}/{:s}'.format(folder,altname)
+            self.savefig(altname, **sf) # save figure to pdf
 
 
 ## convenience function to return a figure and an array of ImageGrid axes
-def getFigAx(subplot, name=None, title=None, title_font='large', figsize=None,  stylesheet=None,
+def getFigAx(subplot, name=None, title=None, title_font='x-large', title_height=None, figsize=None,
              variable_plotargs=None, dataset_plotargs=None, plot_labels=None, yright=False, xtop=False,
-             sharex=None, sharey=None, AxesGrid=False, ngrids=None, direction='row',
+             sharex=None, sharey=None, lAxesGrid=False, ngrids=None, direction='row',
+             lPolarAxes=False, lTaylor = False, 
              axes_pad = None, add_all=True, share_all=None, aspect=False, margins=None,
              label_mode='L', cbar_mode=None, cbar_location='right', lreduce=True,
-             cbar_pad=None, cbar_size='5%', axes_class=None, axes_args=None,
+             cbar_pad=None, cbar_size='5%', axes_class=None, axes_args=None,  stylesheet=None,
              lpresentation=False, lpublication=False, figure_class=None, **figure_args):
   # load stylesheet
   if stylesheet is not None:
@@ -313,16 +344,30 @@ def getFigAx(subplot, name=None, title=None, title_font='large', figsize=None,  
     elif subplot == (2,1) or subplot == (3,1): margins = (0.09,0.11,0.88,0.82)
     elif subplot == (2,2) or subplot == (3,3): margins = (0.06,0.08,0.92,0.92)
     else: margins = (0.09,0.11,0.88,0.82)
-    #elif subplot == (2,2) or subplot == (3,3): margins = (0.09,0.11,0.88,0.82)
-    #else: raise NotImplementedError
-    title_height = getattr(figure_class, 'title_height', 0.05) # use default from figure
+    if title_height is None: title_height = getattr(figure_class, 'title_height', 0.05) # use default from figure
     if title is not None: margins = margins[:3]+(margins[3]-title_height,) # make room for title
 #   # some style sheets have different label sizes
 #   if stylesheet.lower() in ('myggplot','ggplot'):
 #     margins = list(margins)
 #     margins[0] += 0.015; margins[1] -= 0.01 # left, bottom
 #     margins[2] += 0.02; margins[3] += 0.02 # width, height
-  if AxesGrid:
+  # handle special TaylorPlot axes
+  if lTaylor:
+      if not lPolarAxes: lPolarAxes = True
+      if not axes_class: axes_class = TaylorAxes
+  # handle mixed Polar/Axes
+  if isinstance(axes_class, (list,tuple,np.ndarray)):
+      for i,axcls in enumerate(axes_class):
+          if axcls is None:
+              if lTaylor: axes_class[i] = TaylorAxes
+              elif lPolarAxes: axes_class[i] = MyPolarAxes
+              else: axes_class[i] = MyAxes
+          elif axcls.lower() == 'taylor': axes_class[i] = TaylorAxes
+          elif axcls.lower() == 'polar': axes_class[i] = MyPolarAxes
+          elif axcls.lower() in ('regular','default'): axes_class[i] = MyAxes
+          if not issubclass(axcls, Axes): raise TypeError(axcls) 
+  # create axes
+  if lAxesGrid:
     if share_all is None: share_all = True
     if axes_pad is None: axes_pad = 0.05
     # adjust margins for ignored label pads
@@ -332,7 +377,7 @@ def getFigAx(subplot, name=None, title=None, title_font='large', figsize=None,  
     # create axes using the Axes Grid package
     if axes_class is None: axes_class=MyLocatableAxes
     fig = mpl.pylab.figure(facecolor='white', figsize=figsize, axes_class=axes_class, 
-                           FigureClass=MyFigure, **figure_args)
+                           FigureClass=figure_class, **figure_args)
     if axes_args is None: axes_class = (axes_class,{})
     elif isinstance(axes_args,dict): axes_class = (axes_class,axes_args)
     else: raise TypeError
@@ -344,9 +389,34 @@ def getFigAx(subplot, name=None, title=None, title_font='large', figsize=None,  
                      cbar_pad=cbar_pad, cbar_size=cbar_size, axes_class=axes_class)
     # return figure and axes
     axes = np.asarray(grid).reshape(subplot) # don't want flattened array
-    #axes = tuple([ax for ax in grid]) # this is already flattened
-    if lreduce and len(axes) == 1: axes = axes[0] # return a bare axes instance, if there is only one axes    
+    #axes = tuple([ax for ax in grid]) # this is already flattened  
+  elif isinstance(axes_class, (list,tuple,np.ndarray)):
+    # PolarAxes can't share axes and by default don't have labels
+    if figure_args is None: figure_args = dict()
+    fig = figure(facecolor='white', figsize=figsize, FigureClass=figure_class, **figure_args)
+    # now create list of axes
+    if axes_args is None: axes_args = dict()
+    axes = np.empty(subplot, dtype=object); n = 0
+    for i in range(subplot[0]):
+        for j in range(subplot[1]):
+            n += 1
+            axes[i,j] = fig.add_subplot(subplot[0], subplot[1], n, axes_class=axes_class[n-1], **axes_args)      
+    # just adjust margins
+    if axes_pad is None: axes_pad = 0.03
+    wspace = hspace = 0.1
+    margin_dict = dict(left=margins[0], bottom=margins[1], right=margins[0]+margins[2], 
+                       top=margins[1]+margins[3], wspace=wspace, hspace=hspace)
+    fig.subplots_adjust(**margin_dict)      
   else:
+    # select default axes based on other arguments 
+    if axes_class is None:
+        if lPolarAxes:
+            axes_class = MyPolarAxes
+            share_all = sharex = sharey = False
+            # N.B.: PolarAxes does not support sharing of axes, and
+            #       default behavior is to hide labels
+        else:
+            axes_class = MyAxes 
     # create axes using normal subplot routine
     if axes_pad is None: axes_pad = 0.03
     wspace = hspace = axes_pad
@@ -357,39 +427,46 @@ def getFigAx(subplot, name=None, title=None, title_font='large', figsize=None,  
     if sharex: hspace -= 0.015
     if sharey: wspace -= 0.015
     # other axes arguments
-    if axes_class is None: axes_class=MyAxes
     if axes_args is not None and not isinstance(axes_args,dict): raise TypeError
     # create figure
     from matplotlib.pyplot import subplots    
     # GridSpec: http://matplotlib.org/users/gridspec.html 
     fig, axes = subplots(subplot[0], subplot[1], sharex=sharex, sharey=sharey,squeeze=lreduce, 
-                         facecolor='white', figsize=figsize, FigureClass=MyFigure, 
+                         facecolor='white', figsize=figsize, FigureClass=figure_class, 
                          subplot_kw=axes_args, axes_class=axes_class, **figure_args)    
     # there is also a subplot_kw=dict() and fig_kw=dict()
     # just adjust margins
     margin_dict = dict(left=margins[0], bottom=margins[1], right=margins[0]+margins[2], 
                        top=margins[1]+margins[3], wspace=wspace, hspace=hspace)
     fig.subplots_adjust(**margin_dict)
+  # apply reduction
+  if lreduce:
+      if isinstance(axes,np.ndarray): axes = axes.squeeze() # remove singleton dimensions
+      if isinstance(axes,(list,tuple,np.ndarray)) and len(axes) == 1: axes = axes[0] # return a bare axes instance, if there is only one axes
   ## set label positions
-  # X-/Y-labels and -ticks
-  yright = not sharey and subplot[0]==2 if yright is None else yright
-  xtop = not sharex and subplot[1]==2 if xtop is None else xtop
-  if isinstance(axes, Axes): 
-    axes.yright = yright
-    axes.xtop = xtop
-  else:
-    if axes.ndim == 1:
-      if subplot[0] == 2: axes[-1].yright = yright # right panel
-      if subplot[1] == 2: axes[0].xtop = xtop # top panel
-    elif axes.ndim == 2:
-      for ax in axes[:,-1]: ax.yright = yright # right column
-      for ax in axes[0,:]: ax.xtop = xtop # top row
-    else: raise ValueError
+  if not lPolarAxes:
+      # X-/Y-labels and -ticks
+      yright = not sharey and subplot[0]==2 if yright is None else yright
+      xtop = not sharex and subplot[1]==2 if xtop is None else xtop
+      if isinstance(axes, Axes): 
+        axes.yright = yright
+        axes.xtop = xtop
+      else:
+        if axes.ndim == 1:
+          if subplot[0] == 2: axes[-1].yright = yright # right panel
+          if subplot[1] == 2: axes[0].xtop = xtop # top panel
+        elif axes.ndim == 2:
+          for ax in axes[:,-1]: ax.yright = yright # right column
+          for ax in axes[0,:]: ax.xtop = xtop # top row
+        else: raise ValueError
   # add figure title
   if name is None: name = title
   if name is not None: fig.canvas.set_window_title(name) # window title
-  if isinstance(title_font,basestring): title_font = dict(fontsize=title_font)
-  if title is not None: fig.suptitle(title, **title_font) # title on figure (printable)
+  if title is not None:
+      y = 1. - ( title_height / ( 5. if 'x' in title_font else 8. ) ) # smaller title closer to the top
+      if isinstance(title_font,basestring): title_font = dict(fontsize=title_font, y=y)
+      fig.suptitle(title, **title_font) # title on figure (printable)
+  fig.title_height = title_height # save value
   # add default line styles for variables and datasets to axes (figure doesn't need to know)
   if isinstance(axes, np.ndarray):
     for ax in axes.ravel(): 

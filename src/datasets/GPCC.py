@@ -18,14 +18,14 @@ from geodata.netcdf import DatasetNetCDF
 from geodata.gdal import addGDALtoDataset, GridDefinition, loadPickledGridDef, addGeoLocator
 from geodata.misc import DatasetError
 from utils.nctools import writeNetCDF
-from datasets.common import data_root, grid_folder, transformPrecip, timeSlice
+from datasets.common import getRootFolder, grid_folder, transformPrecip, timeSlice
 from datasets.common import translateVarNames, loadObservations, addLandMask, addLengthAndNamesOfMonth, getFileName
 from processing.process import CentralProcessingUnit
 
 ## GPCC Meta-data
 
 dataset_name = 'GPCC'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # long-term mean folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 
 # GPCC grid definition           
 geotransform_025 = (-180.0, 0.25, 0.0, -90.0, 0.0, 0.25)
@@ -233,18 +233,21 @@ loadShapeTimeSeries = loadGPCC_ShpTS # time-series without associated grid (e.g.
 ## (ab)use main execution for quick test
 if __name__ == '__main__':
   
-#   mode = 'test_climatology'; reses = ('025',); period = None
+  mode = 'test_climatology'; reses = ('025',); period = None
 #   mode = 'test_timeseries'; reses = ('25',)
-  mode = 'test_point_climatology'; reses = ('025',); period = None
+#   mode = 'test_point_climatology'; reses = ('025',); period = None
 #   mode = 'test_point_timeseries'; reses = ('05',)  
 #   mode = 'convert_climatology'; reses = ('25',); period = None
 #   reses = ('025','05', '10', '25'); period = None  
-#   mode = 'average_timeseries'; reses = ('25',) # for testing
-#   reses = ('05', '10', '25')
+  mode = 'average_timeseries'; reses = ('25',) # for testing
+  reses = ('05', '10', '25')
 #   reses = ('25',)
+  period = (1970,2000)
 #   period = (1979,1982)
+#   period = (1979,1983)
 #   period = (1979,1984)
 #   period = (1979,1989)
+#   period = (1979,1991)
 #   period = (1979,1994)
 #   period = (1984,1994)
 #   period = (1989,1994)

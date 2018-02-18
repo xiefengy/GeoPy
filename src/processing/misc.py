@@ -13,12 +13,9 @@ from functools import partial
 import yaml,os
 from datetime import datetime
 # internal imports
-from geodata.misc import DatasetError, DateError, isInt
+from geodata.misc import DatasetError, DateError, isInt, ArgumentError
 from utils.misc import namedTuple
 from datasets.common import getFileName
-# specific datasets
-import datasets.WRF as WRF
-import datasets.CESM as CESM
 
 
 # load YAML configuration file
@@ -48,7 +45,7 @@ def loadYAML(default, lfeedback=True):
 
 
 ## convenience function to load WRF experiment list and replace names with Exp objects
-def getExperimentList(experiments, project, dataset, lensembles=True):
+def getExperimentList(experiments, project=None, dataset='WRF', lensembles=True):
   ''' load WRF or CESM experiment list and replace names with Exp objects '''
   # load WRF experiments list
   project = 'projects' if not project else 'projects.{:s}'.format(project)
@@ -66,6 +63,24 @@ def getExperimentList(experiments, project, dataset, lensembles=True):
   # return expanded list of experiments
   return experiments
 
+
+## convenience function to load WRF experiment list and replace names with Exp objects
+def getProjectVars(varlist, project=None, module=None):
+  ''' load a list of variables from a project (module) '''
+  # load WRF experiments list
+  project = 'projects' if not project else 'projects.{:s}'.format(project)
+  module = '__init__' if not module else module
+  mod = import_module('{:s}.{:s}'.format(project,module))
+  # load varlist from project (module) namespace
+  vardict = dict()
+  for varname in varlist:
+    try: vardict[varname] = mod.__dict__[varname]
+    except KeyError: # throw exception is experiment is not found
+      raise KeyError, "Variable '{:s}' not found in {:s} project (module '{:s}').".format(varname,project,module)
+  # return expanded list of experiments
+  return vardict
+
+
 def getPeriodGridString(period, grid, exp=None, beginyear=None):
   ''' utility function to check period and grid and return valid and usable strings '''
   # period
@@ -82,27 +97,36 @@ def getPeriodGridString(period, grid, exp=None, beginyear=None):
 
 
 ## prepare target dataset
-def getTargetFile(dataset=None, mode=None, dataargs=None, lwrite=True, grid=None, period=None, filetype=None):
+def getTargetFile(dataset=None, mode=None, dataargs=None, grid=None, shape=None, station=None, period=None, filetype=None, 
+                  lwrite=True):
   ''' generate filename for target dataset '''
-  # prepare some variables
-  domain = dataargs.domain
-  if filetype is None: filetype = dataargs.filetype
-  if grid is None: grid = dataargs.gridstr # also use grid for station type
+  # for CESM & WRF
+  if grid is None: grid = dataargs.gridstr # also use grid for station/shape type
   if period is None: period = dataargs.periodstr
-  gstr = '_{}'.format(grid) if grid else ''
-  pstr = '_{}'.format(period) if period else ''
-  # figure out filename
-  if dataset == 'WRF' and lwrite:
-    if mode == 'climatology': filename = WRF.clim_file_pattern.format(filetype,domain,gstr,pstr)
-    elif mode == 'time-series': filename = WRF.ts_file_pattern.format(filetype,domain,gstr)
-    else: raise NotImplementedError
-  elif dataset == 'CESM' and lwrite:
-    if mode == 'climatology': filename = CESM.clim_file_pattern.format(filetype,gstr,pstr)
-    elif mode == 'time-series': filename = CESM.ts_file_pattern.format(filetype,gstr)
-    else: raise NotImplementedError
-  elif ( dataset == dataset.upper() or dataset == 'Unity' ) and lwrite: # observational datasets
-    filename = getFileName(grid=grid, period=dataargs.period, name=dataargs.obs_res, filetype=mode)      
-  elif not lwrite: raise DatasetError
+  if dataset in ('WRF','CESM') and lwrite:
+    # prepare some variables
+    domain = dataargs.domain
+    if filetype is None: filetype = dataargs.filetype
+    gstr = '_{}'.format(grid) if grid else ''
+    # prepend shape or station type before grid 
+    if shape and station: raise ArgumentError
+    elif shape: gstr = '_{}{}'.format(shape,gstr)
+    elif station: gstr = '_{}{}'.format(station,gstr)
+    pstr = '_{}'.format(period) if period else ''
+    if dataset == 'WRF': 
+        import datasets.WRF as WRF
+        fileclass = WRF.fileclasses[filetype] if filetype in WRF.fileclasses else WRF.FileType(filetype)
+        if mode == 'climatology': filename = fileclass.climfile.format(domain,gstr,pstr)
+        elif mode == 'time-series': filename = fileclass.tsfile.format(domain,gstr)
+    elif dataset == 'CESM': 
+        import datasets.CESM as CESM
+        fileclass = CESM.fileclasses[filetype] if filetype in CESM.fileclasses else CESM.FileType(filetype)
+        if mode == 'climatology': filename = fileclass.climfile.format(gstr,pstr)
+        elif mode == 'time-series': filename = fileclass.tsfile.format(gstr)
+    else: raise NotImplementedError, "Unsupported Mode: '{:s}'".format(mode)        
+  elif lwrite: # assume observational datasets
+    filename = getFileName(grid=grid, shape=shape, station=station, period=period, name=dataargs.obs_res, filetype=mode)      
+  else: raise DatasetError(dataset)
   if not os.path.exists(dataargs.avgfolder): 
     raise IOError, "Dataset folder '{:s}' does not exist!".format(dataargs.avgfolder)
   # return filename
@@ -147,19 +171,27 @@ def getMetaData(dataset, mode, dataargs, lone=True):
   lclim = False; lts = False
   if mode == 'climatology': lclim = True
   elif mode == 'time-series': lts = True
+  elif mode[-5:] == '-mean': 
+    lclim = True; mode = 'climatology' # only for export to seasonal means (load entire monthly climatology)
   else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)
   # general arguments (dataset independent)
   varlist = dataargs.get('varlist',None)
+  resolution = dataargs.get('resolution',None)
   grid = dataargs.get('grid',None) # get grid
   period = dataargs.get('period',None)
   # determine meta data based on dataset type
   if dataset == 'WRF': 
+    import datasets.WRF as WRF
     # WRF datasets
     obs_res = None # only for datasets (not used here)
     exp = dataargs['experiment'] # need that one
     dataset_name = exp.name
     avgfolder = exp.avgfolder
     filetypes = dataargs['filetypes']
+    fileclasses = WRF.fileclasses.copy()
+    for filetype in filetypes:
+      if filetype not in fileclasses:
+        fileclasses[filetype] = WRF.FileType(filetype)
     domain = dataargs.get('domain',None)
     periodstr, gridstr = getPeriodGridString(period, grid, exp=exp)
     # check arguments
@@ -171,16 +203,17 @@ def getMetaData(dataset, mode, dataargs, lone=True):
       datamsgstr = "Processing WRF '{:s}'-file from Experiment '{:s}' (d{:02d})".format(filetypes[0], dataset_name, domain)
     else: datamsgstr = "Processing WRF dataset from Experiment '{:s}' (d{:02d})".format(dataset_name, domain)       
     # figure out age of source file(s)
-    srcage = getSourceAge(fileclasses=WRF.fileclasses, filetypes=filetypes, exp=exp, domain=domain,
+    srcage = getSourceAge(fileclasses=fileclasses, filetypes=filetypes, exp=exp, domain=domain,
                           periodstr=periodstr, gridstr=gridstr, lclim=lclim, lts=lts)
     # load source data
     if lclim:
       loadfct = partial(WRF.loadWRF, experiment=exp, name=None, domains=domain, grid=grid, varlist=varlist,
-                        period=period, filetypes=filetypes, varatts=None, lconst=True) # still want topography...
+                        period=period, filetypes=filetypes, varatts=None, lconst=True, ltrimT=False) # still want topography...
     elif lts:
       loadfct = partial(WRF.loadWRF_TS, experiment=exp, name=None, domains=domain, grid=grid, varlist=varlist,
-                        filetypes=filetypes, varatts=None, lconst=True) # still want topography...
+                        filetypes=filetypes, varatts=None, lconst=True, ltrimT=False) # still want topography...
   elif dataset == 'CESM': 
+    import datasets.CESM as CESM
     # CESM datasets
     obs_res = None # only for datasets (not used here)
     domain = None # only for WRF
@@ -189,6 +222,10 @@ def getMetaData(dataset, mode, dataargs, lone=True):
     dataset_name = exp.name
     periodstr, gridstr = getPeriodGridString(period, grid, exp=exp)
     filetypes = dataargs['filetypes']
+    fileclasses = CESM.fileclasses.copy()
+    for filetype in filetypes:
+      if filetype not in fileclasses:
+        fileclasses[filetype] = CESM.FileType(filetype)
     # check arguments
     if period is None and lclim: raise DatasetError, "A 'period' argument is required to load climatologies!"
     if lone and len(filetypes) > 1: raise DatasetError # process only one file at a time
@@ -197,7 +234,7 @@ def getMetaData(dataset, mode, dataargs, lone=True):
       datamsgstr = "Processing CESM '{:s}'-file from Experiment '{:s}'".format(filetypes[0], dataset_name) 
     else: datamsgstr = "Processing CESM dataset from Experiment '{:s}'".format(dataset_name) 
     # figure out age of source file(s)
-    srcage = getSourceAge(fileclasses=CESM.fileclasses, filetypes=filetypes, exp=exp, domain=None,
+    srcage = getSourceAge(fileclasses=fileclasses, filetypes=filetypes, exp=exp, domain=None,
                           periodstr=periodstr, gridstr=gridstr, lclim=lclim, lts=lts)
     # load source data 
     load3D = dataargs.pop('load3D',None) # if 3D fields should be loaded (default: False)
@@ -207,11 +244,14 @@ def getMetaData(dataset, mode, dataargs, lone=True):
     elif lts:
       loadfct = partial(CESM.loadCESM_TS, experiment=exp, name=None, grid=grid, varlist=varlist,
                         filetypes=filetypes, varatts=None, load3D=load3D, translateVars=None)     
-  elif dataset == dataset.upper() or dataset == 'Unity':
-    # observational datasets
+  else:
+    # assume observational datasets
     filetypes = [None] # only for CESM & WRF
     domain = None # only for WRF
-    module = import_module('datasets.{0:s}'.format(dataset))      
+    try:
+      module = import_module('datasets.{0:s}'.format(dataset))
+    except ImportError:
+      raise DatasetError("Error loading dataset module '{:s}' from 'datasets' package!".format(dataset))      
     dataset_name = module.dataset_name
     resolution = dataargs['resolution']
     if resolution: obs_res = '{0:s}_{1:s}'.format(dataset_name,resolution)
@@ -225,12 +265,15 @@ def getMetaData(dataset, mode, dataargs, lone=True):
     avgfolder = module.avgfolder
     filepath = '{:s}/{:s}'.format(avgfolder,filename)
     # load pre-processed climatology
-    if lclim:
-      loadfct = partial(module.loadClimatology, name=dataset_name, period=period, grid=grid, 
-                        varlist=varlist, resolution=resolution, varatts=None)
-    elif lts:
-      loadfct = partial(module.loadTimeSeries, name=dataset_name, grid=grid, varlist=varlist,
-                        resolution=resolution, varatts=None)
+    kwargs = dict(name=dataset_name, grid=grid, varlist=varlist, resolution=resolution, varatts=None)
+    if dataset == 'Unity': kwargs['unity_grid'] = dataargs['unity_grid']
+    if lclim and module.loadClimatology is not None: 
+        loadfct = partial(module.loadClimatology, period=period, **kwargs)
+    elif lts and module.loadTimeSeries is not None: 
+        loadfct = partial(module.loadTimeSeries, **kwargs)
+    else: 
+        raise DatasetError("Unable to identify time aggregation mode; the dataset " + 
+                           "'{}' may not support selected mode '{}'.".format(dataset,mode))
     # check if the source file is actually correct
     if os.path.exists(filepath): filelist = [filepath]
     else:
@@ -240,12 +283,10 @@ def getMetaData(dataset, mode, dataargs, lone=True):
     srcage = getSourceAge(filelist=filelist, lclim=lclim, lts=lts)
       # N.B.: it would be nice to print a message, but then we would have to make the logger available,
       #       which would be too much trouble
-  else:
-    raise DatasetError, "Dataset '{:s}' not found!".format(dataset)
   ## assemble and return meta data
   dataargs = namedTuple(dataset_name=dataset_name, period=period, periodstr=periodstr, avgfolder=avgfolder, 
                         filetypes=filetypes,filetype=filetypes[0], domain=domain, obs_res=obs_res, 
-                        varlist=varlist, grid=grid, gridstr=gridstr) 
+                        varlist=varlist, grid=grid, gridstr=gridstr, resolution=resolution) 
   # return meta data
   return dataargs, loadfct, srcage, datamsgstr    
 

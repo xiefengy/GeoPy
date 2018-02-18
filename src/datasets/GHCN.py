@@ -15,7 +15,7 @@ import codecs, calendar, functools
 from warnings import warn
 # internal imports
 from datasets.CRU import loadCRU_StnTS
-from datasets.common import days_per_month, data_root, selectElements, translateVarNames
+from datasets.common import days_per_month, getRootFolder, selectElements, translateVarNames
 from datasets.common import CRU_vars, stn_params, nullNaN
 from geodata.misc import ParseError, ArgumentError, DatasetError, AxisError
 from geodata.misc import RecordClass, StrictRecordClass, isNumber, isInt 
@@ -41,7 +41,7 @@ from utils.constants import precip_thresholds
 ## GHCN (Environment Canada) Meta-data
 
 dataset_name = 'GHCN'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # long-term mean folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 orig_ts_file = '{1:s}.dly' # filename pattern: variable name and station ID
 tsfile = 'ghcn{0:s}_monthly.nc' # filename pattern: station type
 #tsfile_prov = 'ghcn{0:s}_{1:s}_monthly.nc' # filename pattern with province: station type, province  
@@ -406,9 +406,12 @@ class StationRecords(object):
     # loop over lines (each defines a station)
     for line in f:
       z += 1 # increment counter
-      collist = line.split()
+      collist=line[0:38].split()
+      collist.append(line[41:71])
+      lat=float(collist[1])
+      lon=float(collist[2])
+      if lat>5 and lat<49 and lon>55 and lon<135:#Tibet lat and lon range
 #XXX: this needs to be revised based on column/field number, not white space delimiters
-      if len(collist) > 0: # skip empty lines
         stdef = dict() # station specific arguments to instantiate station object
         # loop over column titles
         zz = 0 # column counter

@@ -211,8 +211,7 @@ def asyncPoolEC(func, args, kwargs, NP=1, ldebug=False, ltrialnerror=True):
   ## loop over and process all job sets
   if lparallel:
     # create pool of workers   
-    if NP is None: pool = multiprocessing.Pool() 
-    else: pool = multiprocessing.Pool(processes=NP)
+    pool = multiprocessing.Pool(processes=NP) # NP=None uses all available CPUs
     # distribute tasks to workers
     for arguments in args:
       #exitcodes.append(pool.apply_async(func, arguments, kwargs))
@@ -261,7 +260,8 @@ def apply_along_axis(fct, axis, data, NP=0, chunksize=200, ldebug=False, laax=Tr
   if not axis == data.ndim-1:
     data = np.rollaxis(data, axis=axis, start=data.ndim) # roll sample axis to last (innermost) position
   arrayshape,samplesize = data.shape[:-1],data.shape[-1]
-  arraysize = np.prod(arrayshape)
+#   arraysize = np.prod(arrayshape) if arrayshape else 1
+  arraysize = int(np.prod(arrayshape))
   # flatten array for redistribution
   data = np.reshape(data,(arraysize,samplesize))
   # compute

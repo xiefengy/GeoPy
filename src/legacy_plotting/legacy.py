@@ -25,6 +25,10 @@ def loadDataset(exp, prd, dom, grd, res, filetypes=None, varlist=None, lbackgrou
       from datasets.Unity import loadUnity
       ext = loadUnity(resolution=res, period=prd, grid=grd, varlist=varlist, lautoregrid=lautoregrid)
       axt = 'Merged Observations'        
+    elif exp == 'NRCan': 
+      from datasets.NRCan import loadNRCan
+      ext = loadNRCan(resolution=res, period=prd, grid=grd, varlist=varlist, lautoregrid=lautoregrid)
+      axt = 'NRCan Observations'
     elif exp == 'GPCC': 
       from datasets.GPCC import loadGPCC
       ext = loadGPCC(resolution=res, period=prd, grid=grd, varlist=varlist, lautoregrid=lautoregrid)
@@ -91,7 +95,7 @@ def loadDataset(exp, prd, dom, grd, res, filetypes=None, varlist=None, lbackgrou
       exp = CESM_exps[exp]
       #print exp.name, exp.title
       ext = loadCESM(experiment=exp, period=prd, grid=grd, varlist=varlist, filetypes=filetypes, 
-                     lautoregrid=lautoregrid, exps=CESM_exps)
+                     lautoregrid=lautoregrid, exps=CESM_exps, load3D=True)
       axt = exp.title
   else: 
     # WRF runs are all in lower case
@@ -178,7 +182,7 @@ def loadDatasets(explist, n=None, varlist=None, titles=None, periods=None, domai
   # for load function (below)
   if lbackground and not ltuple: raise ValueError
   # check and expand lists
-  if n is None: n = len(explist)
+  if n is None: n = 1 if isinstance(explist,basestring) else len(explist)
   elif not isinstance(n, (int,np.integer)): raise TypeError
   explist = checkItemList(explist, n, (basestring,tuple))
   titles = checkItemList(titles, n, basestring, default=None)
@@ -194,15 +198,20 @@ def loadDatasets(explist, n=None, varlist=None, titles=None, periods=None, domai
     vl = set()
     for var in varlist: 
       if isinstance(var,(tuple,list)): 
-        if isinstance(var[i], dict): vl.update(var[i].values())
-        else: vl.add(var[i])
+        try: var[i]
+        except:
+          pass
+        if isinstance(var[i], dict): 
+          vl.update(var[i].values())
+        else: 
+          vl.add(var[i])
       elif isinstance(var, dict): vl.update(var.values())
       else: vl.add(var)
     vl.update(('lon2D','lat2D','landmask','landfrac')) # landfrac is needed for CESM landmask
     varlists.append(vl)
 
   def addPeriodExt(exp, prd):
-    if exp[-5:] not in ('-2050','-2100'):
+    if prd and exp[-5:] not in ('-2050','-2100'):
       if prd[:5] in ('2045-','2050-'): exp = exp + '-2050'
       elif prd[:5] in ('2085-','2090-'): exp = exp + '-2100' 
     return exp

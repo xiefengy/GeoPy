@@ -13,7 +13,7 @@ from importlib import import_module
 from datetime import datetime
 import logging     
 # internal imports
-from geodata.misc import DateError, printList
+from geodata.misc import DateError, DatasetError, printList
 from geodata.netcdf import DatasetNetCDF
 from geodata.base import Dataset
 from geodata.gdal import GDALError, GridDefinition, addGeoLocator
@@ -51,8 +51,7 @@ def performRegridding(dataset, mode, griddef, dataargs, loverwrite=False, varlis
   dataset_name = dataargs.dataset_name; periodstr = dataargs.periodstr; avgfolder = dataargs.avgfolder
 
   # get filename for target dataset and do some checks
-  filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, 
-                           grid=griddef.name.lower(), period=None, filetype=None) 
+  filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, grid=griddef.name.lower(),) 
     
   # prepare target dataset
   if ldebug: filename = 'test_' + filename
@@ -76,7 +75,6 @@ def performRegridding(dataset, mode, griddef, dataargs, loverwrite=False, varlis
             gridage = datetime.fromtimestamp(os.path.getmtime(griddef.filepath))
             if age < gridage: lskip = False
         # N.B.: NetCDF files smaller than 1MB are usually incomplete header fragments from a previous crashed
-      if not lskip: os.remove(filepath) # recompute
   
   # depending on last modification time of file or overwrite setting, start computation, or skip
   if lskip:        
@@ -192,6 +190,7 @@ if __name__ == '__main__':
     # Datasets
     datasets = config['datasets']
     resolutions = config['resolutions']
+    unity_grid = config.get('unity_grid',None)
     lLTM = config['lLTM']
     # CESM
     CESM_project = config['CESM_project']
@@ -209,26 +208,31 @@ if __name__ == '__main__':
     # settings for testing and debugging
 #     NP = 1 ; ldebug = True # for quick computations
     NP = 4 ; ldebug = False # just for tests
-    modes = ('climatology',) # 'climatology','time-series'
+    modes = ('climatology','time-series') # 'climatology','time-series'
+#     modes = ('climatology',) # 'climatology','time-series'
 #     modes = ('time-series',) # 'climatology','time-series'
     loverwrite = False
     varlist = None
-#     varlist = ['precip',]
+#     varlist = ['LU_INDEX',]
     periods = []
 #     periods += [1]
 #     periods += [3]
 #     periods += [5]
+#     periods += [7]
 #     periods += [10]
-    periods += [15]
-#     periods += [30]
+#     periods += [15]
+    periods += [30]
     # Observations/Reanalysis
-    resolutions = {'CRU':'','GPCC':['025','05','10','25'],'NARR':'','CFSR':['05','031']}
+    resolutions = {'CRU':'','GPCC':['025','05','10','25'],'NARR':'','CFSR':['05','031'],'NRCan':'NA12'}; unity_grid = 'arb2_d02'
     datasets = []
     lLTM = True # also regrid the long-term mean climatologies 
-#     datasets += ['PRISM','GPCC','PCIC']; periods = None
-#     datasets += ['CFSR', 'NARR'] # CFSR_05 does not have precip
-#     datasets += ['GPCC']; resolutions = {'GPCC':['025']}
-    datasets += ['GPCC','CRU']; #resolutions = {'GPCC':['05']}
+    datasets += ['NRCan']; lLTM = False; periods = [(1970,2000),(1980,2010)] # NRCan normals period
+#     resolutions = {'NRCan': ['na12_ephemeral','na12_maritime','na12_prairies'][2:]}
+#     datasets += ['PRISM','GPCC','PCIC']; #periods = None
+#     datasets += ['CFSR', ] # CFSR_05 does not have precip
+#     datasets += ['GPCC']; resolutions = {'GPCC':['025','05']}
+#     datasets += ['GPCC']; # resolutions = {'GPCC':['05']}
+#     datasets += ['CRU']
     # CESM experiments (short or long name) 
     CESM_project = None # all available experiments
     load3D = False
@@ -240,11 +244,32 @@ if __name__ == '__main__':
 #     CESM_filetypes = ['atm','lnd']
     CESM_filetypes = ['atm']
     # WRF experiments (short or long name)
-    WRF_project = 'GreatLakes' # only WesternCanada experiments
+    WRF_project = 'GreatLakes' # only GreatLakes experiments
+#     WRF_project = 'WesternCanada' # only WesternCanada experiments
 #     WRF_experiments = None # use None to process all WRF experiments
     WRF_experiments = []
+#     WRF_experiments += ['3km-ensemble','erai-3km','max-3km','max-3km-2100'][2:]
 #     WRF_experiments += ['g-ensemble','g-ensemble-2050','g-ensemble-2100']
-#     WRF_experiments += ['max-ctrl-2050']
+#     WRF_experiments += ['t-ensemble','t-ensemble-2050','t-ensemble-2100']
+#     WRF_experiments += ['g3-ensemble','g3-ensemble-2050','g3-ensemble-2100',]
+#     WRF_experiments += ['t3-ensemble','t3-ensemble-2050','t3-ensemble-2100']
+#     WRF_experiments += ['erai-g','erai-t']
+#     WRF_experiments += ['erai-g3','erai-t3']
+#     WRF_experiments += ['t3-ensemble-2100','g3-ensemble-2100']
+#     WRF_experiments += ['g-ctrl',     'g-ens-A',     'g-ens-B',     'g-ens-C',]
+#     WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
+#     WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
+#     WRF_experiments += ['t-ctrl',     't-ens-A',     't-ens-B',     't-ens-C',]
+#     WRF_experiments += ['t-ctrl-2050','t-ens-A-2050','t-ens-B-2050','t-ens-C-2050',]
+#     WRF_experiments += ['t-ctrl-2100','t-ens-A-2100','t-ens-B-2100','t-ens-C-2100',]
+#     WRF_experiments += ['g3-ctrl',     'g3-ens-A',     'g3-ens-B',     'g3-ens-C',]
+#     WRF_experiments += ['g3-ctrl-2050','g3-ens-A-2050','g3-ens-B-2050','g3-ens-C-2050',]
+#     WRF_experiments += ['g3-ctrl-2100','g3-ens-A-2100','g3-ens-B-2100','g3-ens-C-2100',]
+#     WRF_experiments += ['t3-ctrl',     't3-ens-A',     't3-ens-B',     't3-ens-C',]
+#     WRF_experiments += ['t3-ctrl-2050','t3-ens-A-2050','t3-ens-B-2050','t3-ens-C-2050',]
+#     WRF_experiments += ['t3-ctrl-2100','t3-ens-A-2100','t3-ens-B-2100','t3-ens-C-2100',]
+#     WRF_experiments += ['g-ensemble','t-ensemble']
+#     WRF_experiments += ['t-ensemble']
 #     WRF_experiments += ['new-v361-ctrl', 'new-v361-ctrl-2050', 'new-v361-ctrl-2100']
 #     WRF_experiments += ['erai-v361-noah', 'new-v361-ctrl', 'new-v36-clm',]
 #     WRF_experiments += ['erai-wc2-bugaboo','erai-wc2-rocks']
@@ -262,27 +287,35 @@ if __name__ == '__main__':
 #     WRF_experiments += ['ctrl-1-arb1', 'ctrl-2-arb1', 'ctrl-arb1-2050'] #  old ctrl simulations (arb1)
 #     WRF_experiments += ['cfsr-cam', 'cam-ens-A', 'cam-ens-B', 'cam-ens-C'] # old ensemble simulations (arb1)
     # other WRF parameters 
-    domains = 1 # domains to be processed
+    domains = (2,) # domains to be processed
 #     domains = None # process all domains
-    WRF_filetypes = ('hydro','xtrm','srfc','lsm','aux') # filetypes to be processed
-#     WRF_filetypes = ('srfc',) # filetypes to be processed # ,'rad'
+    WRF_filetypes = ('hydro','xtrm','srfc','lsm','rad','aux') # filetypes to be processed
+#     WRF_filetypes = ('hydro',) # filetypes to be processed
 #     WRF_filetypes = ('srfc','xtrm','plev3d','hydro','lsm') # filetypes to be processed # ,'rad'
-#     WRF_filetypes = ('const',); periods = None
+#     WRF_filetypes = ('const',); modes = ('time-series',); periods = None
     # grid to project onto
     grids = dict()
-#     grids['grw1'] = None # smaller grid, ideal for testing
-#     grids['grw2'] = None # very small grid, ideal for testing
+    grids['asb1'] = None # small grid for Assiniboine river basin, 5km
+#     grids['brd1'] = None # small grid for Assiniboine subbasin, 5km
+#     grids['grw1'] = None # high-res grid for GRW, 1km
+    grids['grw2'] = None # small grid for GRW, 5km
+    grids['snw1'] = None # large grid for whole Canada
+    grids['can1'] = None # large grid for whole Canada
 #     grids['wc2'] = ('d02','d01') # new Brian's Columbia domain (Western Canada 2)
-#     grids['glb1'] = ('d01',) # Marc's standard GLB outer domain
-    grids['glb1'] = ('d02',) # Marc's standard GLB inner domain
-#     grids['glb1-90km'] = ('d01',) # 90km GLB domain
+    grids['glb1'] = ('d01','d02',) # Marc's/Jon's standard Great Lakes domain
+# #     grids['glb1'] = ('d02',) # Marc's standard GLB inner domain
+    grids['glb1-90km'] = ('d01',) # 90km GLB domain
 #     grids['arb2'] = ('d01','d02') # WRF standard ARB inner domain
-#     grids['ARB_small'] = ('025','05') # small custom geographic grids
-#     grids['ARB_large'] = ('025','05') # large custom geographic grids
-#     grids['cesm1x1'] = (None,) # CESM grid
-#     grids['NARR'] = (None,) # NARR grid
-#     grids['CRU'] = (None,) # CRU grid
-    
+#     grids['arb3'] = ('d01','d02','d03',) # WRF standard ARB inner domain
+#     grids['arb3'] = ('d03',) # WRF standard ARB inner domain
+# #     grids['ARB_small'] = ('025','05') # small custom geographic grids
+# #     grids['ARB_large'] = ('025','05') # large custom geographic grids
+    grids['cesm1x1'] = None # CESM 1-deg. grid
+#     grids['NARR'] = None # NARR grid
+#     grids['CRU'] = None # CRU grid
+#     grids['GPCC'] = ('025',) # GPCC LTM grid
+#     grids['PRISM'] = None # larger PRISM grid
+#     grids['PCIC'] = None # 1km PCIC PRISM grid
   
   ## process arguments    
   if isinstance(periods, (np.integer,int)): periods = [periods]
@@ -293,7 +326,10 @@ if __name__ == '__main__':
   CESM_experiments = getExperimentList(CESM_experiments, CESM_project, 'CESM')
   # expand datasets and resolutions
   if datasets is None: datasets = gridded_datasets  
-  
+  if unity_grid is None and 'Unity' in datasets:
+    if WRF_project: unity_grid = import_module('projects.{:s}'.format(WRF_project)).unity_grid
+    else: raise DatasetError("Dataset 'Unity' has no native grid - please set 'unity_grid'.") 
+
   # print an announcement
   if len(WRF_experiments) > 0:
     print('\n Regridding WRF Datasets:')
@@ -346,19 +382,19 @@ if __name__ == '__main__':
               if resolutions is None: dsreses = mod.LTM_grids
               elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.LTM_grids]  
               for dsres in dsreses: 
-                args.append( (dataset, mode, griddef, dict(varlist=varlist, period=None, resolution=dsres)) ) # append to list
+                args.append( (dataset, mode, griddef, dict(varlist=varlist, period=None, resolution=dsres, unity_grid=unity_grid)) ) # append to list
             # climatologies derived from time-series
             if resolutions is None: dsreses = mod.TS_grids
             elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
             for dsres in dsreses:
               for period in periodlist:
-                args.append( (dataset, mode, griddef, dict(varlist=varlist, period=period, resolution=dsres)) ) # append to list            
+                args.append( (dataset, mode, griddef, dict(varlist=varlist, period=period, resolution=dsres, unity_grid=unity_grid)) ) # append to list            
           elif mode == 'time-series': 
             # regrid the entire time-series
             if resolutions is None: dsreses = mod.TS_grids
             elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
             for dsres in dsreses:
-              args.append( (dataset, mode, griddef, dict(varlist=varlist, period=None, resolution=dsres)) ) # append to list            
+              args.append( (dataset, mode, griddef, dict(varlist=varlist, period=None, resolution=dsres, unity_grid=unity_grid)) ) # append to list            
         
         # CESM datasets
         for experiment in CESM_experiments:

@@ -12,7 +12,7 @@ import numpy as np
 import numpy.ma as ma
 import netCDF4 as nc # netcdf python module
 # internal imports
-from datasets.common import days_per_month, name_of_month, data_root, loadObservations
+from datasets.common import days_per_month, name_of_month, getRootFolder, loadObservations
 # from geodata.utils import DatasetError
 from warnings import warn
 from geodata.gdal import GridDefinition
@@ -20,7 +20,7 @@ from geodata.gdal import GridDefinition
 ## PRISM Meta-data
 
 dataset_name = 'PRISM'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # long-term mean folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 
 # PRISM grid definition
 dlat = dlon = 1./24. #  0.041666666667
@@ -167,8 +167,8 @@ def genCoord():
 if __name__ == '__main__':
     
 #   mode = 'test_climatology'
-  mode = 'test_point_climatology'
-#   mode = 'convert_ASCII'
+#   mode = 'test_point_climatology'
+  mode = 'convert_ASCII'
   pntset = 'shpavg' # 'ecprecip
   
   # do some tests
@@ -243,7 +243,7 @@ if __name__ == '__main__':
     ## create NetCDF file
     
     # initialize netcdf dataset structure
-    outfile = avgfolder+avgfile
+    outfile = avgfolder+'prism_clim.nc' # avgfile
     print('\nWriting data to disk: %s'%outfile)
     # create groups for different resolution
     outdata = nc.Dataset(outfile, 'w', format='NETCDF4') # outgrp.createGroup('fineres')

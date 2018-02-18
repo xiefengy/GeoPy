@@ -121,10 +121,13 @@ def computeClimatology(experiment, filetype, domain, periods=None, offset=0, gri
           logger.info(skipmsg)              
         else:
            
+          if griddef is None: lregrid = False
+          else: lregrid = True
+          
           ## begin actual computation
           beginmsg = "\n{:s}   <<<   Computing '{:s}' (d{:02d}) Climatology from {:s}".format(
                       pidstr,dataset_name,domain,periodstr)
-          if griddef is None: beginmsg += "  >>>   \n" 
+          if not lregrid: beginmsg += "  >>>   \n" 
           else: beginmsg += " ('{:s}' grid)  >>>   \n".format(griddef.name)
           logger.info(beginmsg)
   
@@ -137,10 +140,9 @@ def computeClimatology(experiment, filetype, domain, periods=None, offset=0, gri
           if os.path.exists(tmpfilepath): os.remove(tmpfilepath) # remove old temp files
           sink = DatasetNetCDF(name='WRF Climatology', folder=expfolder, filelist=[tmpfilename], atts=source.atts.copy(), mode='w')
           sink.atts.period = periodstr 
+#           if lregrid: addGDALtoDataset(sink, griddef=griddef)
           
           # initialize processing
-          if griddef is None: lregrid = False
-          else: lregrid = True
           CPU = CentralProcessingUnit(source, sink, varlist=varlist, tmp=lregrid, feedback=ldebug) # no need for lat/lon
           
           # start processing climatology
@@ -152,7 +154,8 @@ def computeClimatology(experiment, filetype, domain, periods=None, offset=0, gri
           # reproject and resample (regrid) dataset
           if lregrid:
             CPU.Regrid(griddef=griddef, flush=True)
-            logger.info('%s    ---   '+str(griddef.geotansform)+'   ---   \n'%(pidstr))              
+            logger.info('{:s}   ---   {:s}   ---   \n'.format(pidstr,griddef.name))              
+            logger.debug('{:s}   ---   {:s}   ---   \n'.format(pidstr,str(griddef)))              
           
           # sync temporary storage with output dataset (sink)
           CPU.sync(flush=True)
@@ -234,22 +237,34 @@ if __name__ == '__main__':
     varlist = config['varlist']
     periods = config['periods']
     offset = config['offset']
-    project = config['project']
-    experiments = config['experiments']
-    filetypes = config['filetypes']
+    WRF_project = config['WRF_project']
+    WRF_experiments = config['WRF_experiments']
+    WRF_filetypes = config['WRF_filetypes']
     domains = config['domains']
     grid = config['grid']
   else:
 #     NP = 1 ; ldebug = True # just for tests
-    NP = 2 ; ldebug = False # just for tests
-    loverwrite = True
+    NP = 3 ; ldebug = False # just for tests
+    loverwrite = False
     varlist = None
-    project = 'GreatLakes'
-    experiments = ['g-ens-A','g-ctrl']
-#     experiments += ['g-ctrl'+tag for tag in ('-2050','-2100')]
-#     experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',]
-#     experiments += ['max-3km']
-#     experiments += ['erai-max']
+    WRF_project = 'GreatLakes'
+    WRF_experiments = []
+#     WRF_experiments = ['g-ens-C']
+#     WRF_experiments += ['g-ctrl','g-ens-A','g-ens-B','g-ens-C',
+#                    'g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',
+#                    'g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
+    WRF_experiments += [ 't-ctrl','t-ens-A','t-ens-B','t-ens-C',
+                   't-ctrl-2050','t-ens-A-2050','t-ens-B-2050','t-ens-C-2050',
+                   't-ctrl-2100','t-ens-A-2100','t-ens-B-2100','t-ens-C-2100',]
+#     WRF_experiments = ['g3-ensemble','g3-ensemble-2050','g3-ensemble-2050',
+#                    't3-ensemble','t3-ensemble-2050','t3-ensemble-2050']
+#     WRF_experiments += ['erai-g3','erai-t3']
+#     WRF_experiments += ['erai-g','erai-t']
+#     WRF_experiments = ['g-ens-A','g-ctrl']
+#     WRF_experiments += ['g-ctrl'+tag for tag in ('','-2050','-2100')]
+#     WRF_experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',]
+#     WRF_experiments += ['max-3km']
+#     WRF_experiments += ['erai-max']
     offset = 0 # number of years from simulation start
     periods = [] # not that all periods are handled within one process! 
 #     periods += [1]
@@ -258,14 +273,16 @@ if __name__ == '__main__':
 #     periods += [9]
 #     periods += [10]
     periods += [15]
-    domains = 2 # domains to be processed
-#     domains = None # process all domains
-    filetypes = ['srfc','xtrm','plev3d','hydro','lsm'][1:] # filetypes to be processed # ,'rad'
-#     filetypes = ['srfc'] # filetypes to be processed
-    grid = None # use native grid
+#     periods += [30]
+#     domains = 2 # domains to be processed
+    domains = None # process all domains
+#     WRF_filetypes = ['srfc','xtrm','plev3d','hydro','lsm','rad'] # filetypes to be processed # ,'rad'
+    WRF_filetypes = ['hydro','xtrm','hydro','lsm','rad']
+#     WRF_filetypes = ['rad'] # filetypes to be processed
+    grid = 'can1' # use native grid
 
   # check and expand WRF experiment list
-  experiments = getExperimentList(experiments, project, 'WRF')
+  WRF_experiments = getExperimentList(WRF_experiments, WRF_project, 'WRF')
   if isinstance(domains, (np.integer,int)): domains = [domains]
   if isinstance(periods, (np.integer,int)): periods = [periods]
 
@@ -275,16 +292,16 @@ if __name__ == '__main__':
   
   # print an announcement
   print('\n Computing Climatologies for WRF experiments:\n')
-  print([exp.name for exp in experiments])
-  if grid != 'native': print('\nRegridding to \'{0:s}\' grid.\n'.format(grid))
+  print([exp.name for exp in WRF_experiments])
+  if grid: print('\nRegridding to \'{0:s}\' grid.\n'.format(grid))
   print('\nOVERWRITE: {0:s}\n'.format(str(loverwrite)))
       
   # assemble argument list and do regridding
   args = [] # list of arguments for workers, i.e. "work packages"
   # generate list of parameters
-  for experiment in experiments:    
+  for experiment in WRF_experiments:    
     # loop over file types
-    for filetype in filetypes:                
+    for filetype in WRF_filetypes:                
       # effectively, loop over domains
       if domains is None:
         tmpdom = range(1,experiment.domains+1)

@@ -13,17 +13,15 @@ import numpy as np
 from copy import deepcopy
 import codecs, calendar, functools
 from warnings import warn
-from collections import OrderedDict
 # internal imports
 from datasets.CRU import loadCRU_StnTS
-from datasets.common import days_per_month, data_root, selectElements, translateVarNames
+from datasets.common import days_per_month, getRootFolder, selectElements, translateVarNames
 from datasets.common import CRU_vars, stn_params, nullNaN
 from geodata.misc import ParseError, DateError, VariableError, ArgumentError, DatasetError, AxisError
 from geodata.misc import RecordClass, StrictRecordClass, isNumber, isInt 
 from geodata.base import Axis, Variable, Dataset
 from utils.nctools import writeNetCDF
 from geodata.netcdf import DatasetNetCDF
-from geodata.gdal import NamedShape, ShapeInfo
 # import derived variables from the WRF Tools package wrfavg
 import imp, os
 # read code root folder from environment variable
@@ -43,7 +41,7 @@ from utils.constants import precip_thresholds
 ## EC (Environment Canada) Meta-data
 
 dataset_name = 'EC'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # long-term mean folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 orig_ts_file = '{0:s}{1:s}.txt' # filename pattern: variable name and station ID
 tsfile = 'ec{0:s}_monthly.nc' # filename pattern: station type
 tsfile_prov = 'ec{0:s}_{1:s}_monthly.nc' # filename pattern with province: station type, province  
@@ -94,36 +92,6 @@ for threshold in precip_thresholds:
 # list of variables to load
 variable_list = varatts.keys() # also includes coordinate fields    
 
-# expand province names
-province_names = OrderedDict() # make sure they are sorted alphabeically
-province_names['AB'] = 'Alberta'
-province_names['BC'] = 'British Columbia'
-province_names['MB'] = 'Manitoba'
-province_names['NB'] = 'New Brunswick'
-province_names['NL'] = 'Newfoundland and Labrador'
-province_names['NS'] = 'Nova Scotia'
-province_names['NT'] = 'Northwest Territories'
-province_names['NU'] = 'Nunavut'
-province_names['PE'] = 'Prince Edward Island'
-province_names['ON'] = 'Ontario'
-province_names['QC'] = 'Quebec'
-province_names['SK'] = 'Saskatchewan'
-province_names['YT'] = 'Yukon Territory'
-province_names['CAN'] = 'Canada'
-
-# generate province info objects
-province_info = OrderedDict()
-provinces = OrderedDict()
-for key,val in province_names.iteritems():
-  shapetype = 'NAT' if key == 'CAN' else 'PRV'
-  prov = ShapeInfo(name=key, long_name=val, shapefiles=[val], shapetype=shapetype, 
-                   data_source='', folder=root_folder+'/Provinces/')
-  province_info[key] = prov
-  if len(prov.shapefiles) == 1 :
-    provinces[prov.name] = NamedShape(area=prov, subarea=None)
-  else: 
-    for subarea in prov.shapefiles.iterkeys():
-      provinces[prov.name] = NamedShape(area=prov, subarea=subarea)
 
 ## a class that handles access to station records in ASCII files
 class DailyStationRecord(StrictRecordClass):
@@ -907,8 +875,8 @@ loadStationClimatology = loadEC # pre-processed, standardized climatology
 if __name__ == '__main__':
 
 #   mode = 'test_selection'
-#   mode = 'test_timeseries'
-  mode = 'test_station_object'
+  mode = 'test_timeseries'
+#   mode = 'test_station_object'
 #   mode = 'test_station_reader'
 #   mode = 'test_conversion'
 #   mode = 'convert_prov_stations'

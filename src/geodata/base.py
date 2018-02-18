@@ -18,9 +18,10 @@ from warnings import warn
 # my own imports
 import utils.nanfunctions as nf
 from plotting.properties import getPlotAtts, variablePlotatts # import plot properties from different file
-from geodata.misc import checkIndex, isEqual, isInt, isNumber, AttrDict, joinDicts, floateps
+from geodata.misc import checkIndex, isEqual, isInt, isNumber, AttrDict, joinDicts, floateps, TimeAxisError,\
+  EnsembleError
 from geodata.misc import genStrArray, translateSeasons
-from geodata.misc import VariableError, AxisError, DataError, DatasetError, ArgumentError
+from geodata.misc import VariableError, AxisError, DataError, DatasetError, ArgumentError, EmptyDatasetError
 from processing.multiprocess import apply_along_axis
 from utils.misc import histogram, binedges, detrend, percentile, tabulate
      
@@ -78,12 +79,13 @@ def BinaryCheckAndCreateVar(sameUnits=True, linplace=False):
         if orig.shape != other.shape:
           mind = min(orig.ndim,other.ndim)
           if orig.ndim == other.ndim or orig.shape[:mind] != other.shape[:mind]:
-            raise AxisError, 'Variables need to have the same shape and compatible axes!'
+            raise AxisError('Variables need to have the same shape and compatible axes!')
           # else we can broadcast
         if sameUnits and orig.units != other.units: 
-          raise VariableError, 'Variable units have to be identical for addition!'
+          raise VariableError('Variable units have to be identical for addition!')
         for lax,rax in zip(orig.axes,other.axes):
-          if (lax.coord != rax.coord).any(): raise AxisError,  'Variables need to have identical coordinate arrays!'
+          if not isEqual(lax[:],rax[:]): 
+              raise AxisError('Variables need to have identical coordinate arrays!\n{}'.format(lax[:]-rax[:]))
         if not other.data: other.load()
       elif not isinstance(other, (np.ndarray,numbers.Number,np.integer,np.inexact)): 
         raise TypeError, 'Can only operate with Variables or numerical types!'
@@ -97,7 +99,7 @@ def BinaryCheckAndCreateVar(sameUnits=True, linplace=False):
         if other.ndim < orig.ndim: 
           otherdata = otherdata.reshape(other.shape+(1,)*(orig.ndim-other.ndim))
         elif other.ndim < orig.ndim: 
-          raise NotImplementedError, "Can only broadcast second Variable in binary operation. "
+          raise NotImplementedError("Can only broadcast second Variable in binary operation.")
       else:
         othername = str(other)
         otherunits = None
@@ -138,8 +140,8 @@ class ReduceVar(object): # not a Variable child!!!
   def __init__(self, reduceop):
     ''' Save original operation. '''
     self.reduceop = reduceop
-  def __call__(self, var, asVar=None, axis=None, axes=None, lcheckVar=True, lcheckAxis=True,
-                          fillValue=None, lrecursive=False, lall=True, **kwaxes):
+  def __call__(self, var, asVar=None, axis=None, axes=None, lcheckVar=True, lcheckAxis=True, fillValue=None, 
+               lrecursive=False, lall=True, keepdims=False, keepname=False, **kwaxes):
     ''' Figure out axes, perform sanity checks, then execute operation, and return result as a Variable 
         instance. Axes are specified either in a list ('axes') or as keyword arguments with corresponding
         slices. '''
@@ -160,6 +162,7 @@ class ReduceVar(object): # not a Variable child!!!
           axis = None
       axes =axes.union(slcaxes.keys())
     # take shortcut?
+    newaxes = None # used later
     if axis is None and axes is None:
       # simple and quick, less overhead
       if not var.data: var.load()
@@ -189,6 +192,8 @@ class ReduceVar(object): # not a Variable child!!!
           if not var.hasAxis(axes, lany=not lall, lall=lall):
             return None # nothing to do
             # if not lrecursive, missing axes will be skipped 
+      # convert instances and indices to names
+      axes = [var.getAxis(ax).name for ax in axes]
       # N.B.: leave checking of slices to var.slicing (below)
       ## get data from Variable  
       # use overloaded call method to index with coordinate values directly 
@@ -206,7 +211,7 @@ class ReduceVar(object): # not a Variable child!!!
         name = var.name; units = var.units # defaults, in case axlist is empty...    
         for axis in axlist:
           # apply reduction operation with axis argument, looping over axes
-          data, name, units = self.reduceop(var, data, axidx=var.axisIndex(axis), **kwargs)
+          data, name, units = self.reduceop(var, data, axidx=var.axisIndex(axis), keepdims=keepdims, **kwargs)
       else:
         if len(axes) > 1:
           # merge axes
@@ -218,22 +223,41 @@ class ReduceVar(object): # not a Variable child!!!
           else: var = tmp
           data = var.getArray(unmask= not fillValue is None, fillValue=fillValue)
           # apply reduction operation over merged axes
-          data, name, units = self.reduceop(var, data, axidx=var.axisIndex(sample_axis), **kwargs)
+          data, name, units = self.reduceop(var, data, axidx=var.axisIndex(sample_axis), keepdims=keepdims, **kwargs)
         else:
           # apply reduction operation over axis
           data = var.getArray(unmask= not fillValue is None, fillValue=fillValue)
-          data, name, units = self.reduceop(var, data, axidx=var.axisIndex(tuple(axes)[0]), **kwargs)
+          data, name, units = self.reduceop(var, data, axidx=var.axisIndex(tuple(axes)[0]), keepdims=keepdims, **kwargs)
       # squeeze removed dimension (but no other!)
-      newshape = [len(ax) for ax in var.axes if not ax.name in axes]
+      if keepdims: newshape = [1 if ax.name in axes else len(ax) for ax in var.axes]
+      else: newshape = [len(ax) for ax in var.axes if not ax.name in axes]      
       #print data.shape, newshape
       data = data.reshape(newshape)
       # N.B.: other singleton dimensions will have been removed, too
     ## cast into Variable
     # whether or not to cast as Variable (default: Yes)
     if asVar is None: asVar = True # default for iterative reduction
-    if asVar: newaxes = [ax for ax in var.axes if not ax.name in axes]
-    if asVar: 
-      redvar = var.copy(name=name, units=units, axes=newaxes, data=data)
+    if asVar:
+      if isinstance(newaxes,tuple): pass # already assigned in shortcut (see above)
+      elif keepdims:
+        # repeat the array along the singleton axes, in order to fit the Axis
+        newaxes = []
+        for i,ax in enumerate(var.axes):
+            if ax.name in axes:
+                # create a new axis with same attributes but length 1 and NaN as coordinate vectore
+                assert data.shape[i] == 1
+                newax = Axis(coord=[np.NaN], atts=ax.atts)
+                newaxes.append(newax)
+            else:
+                # create copy of old axis
+                assert data.shape[i] == len(ax) 
+                newaxes.append(ax.copy())
+#         for i,ax in enumerate(var.axes):
+#           if ax.name in axes:
+#             data = np.ma.repeat(data, repeats=len(ax), axis=i)
+#         newaxes = var.axes # use old axes
+      else: newaxes = tuple([ax for ax in var.axes if not ax.name in axes]) # remove squeezed axes
+      redvar = var.copy(name=var.name if keepname else name, units=units, axes=newaxes, data=data)
 #       redvar = Variable(name=var.name, units=var.units, axes=newaxes, data=data, 
 #                      fillValue=var.fillValue, atts=var.atts.copy(), plot=var.plot.copy())
     else: redvar = data
@@ -419,18 +443,19 @@ class Variable(object):
     ''' The data type of the Variable (inferred from data). '''
     dtype = self._dtype
     if self.data and dtype != self.data_array.dtype:
-      DataError, "Dtype mismatch!"
+        dtype = self.data_array.dtype
+        self._dtype = dtype
+#       raise DataError(("Dtype mismatch!",dtype))
     return dtype   
   @dtype.setter
   def dtype(self, dtype):
-    if self.data:
-      self.data_array = self.data_array.astype(dtype)
+    if self.data: self.data_array = self.data_array.astype(dtype)
     self._dtype = dtype
 
   @property
   def strvar(self):
     ''' If the data type is a String kind '''
-    return self.dtype.kind == 'S'   
+    return self.dtype.kind in ('S','U')   
 
   @property
   def strlen(self):
@@ -441,7 +466,8 @@ class Variable(object):
   def ndim(self):
     ''' The number of dimensions (inferred from axes). '''
     ndim = len(self.axes)
-    if self.data and ndim != self.data_array.ndim: raise DataError, 'Dimension mismatch!' 
+    if self.data and ndim != self.data_array.ndim: 
+        raise DataError('Dimension mismatch: {} != {}'.format(ndim,self.data_array.ndim))
     return ndim   
   
   @property
@@ -449,7 +475,7 @@ class Variable(object):
     ''' The length of each dimension (shape of data; inferred from axes). '''
     shape = tuple(len(ax) for ax in self.axes)
     if self.data and shape != self.data_array.shape: 
-      raise DataError, 'Shape mismatch!'
+        raise DataError('Shape mismatch: {} != {}'.format(shape,self.data_array.shape))
     return shape
   
   @property
@@ -465,21 +491,36 @@ class Variable(object):
     fillValue = self.atts.get('fillValue',None)
     if self.data and self.masked:
       if  fillValue is None:
-        raise DataError, 'Invalid FillValue: None!'      
+        #raise DataError('Invalid FillValue: None!')
+        fillValue = self.data_array._fill_value
       elif fillValue != self.data_array._fill_value:
-        if  not np.isnan(fillValue) or not np.isnan(self.data_array._fill_value):
-          raise DataError, 'FillValue mismatch!' # N.B.: NaN's are never equal           
+        if not np.isnan(fillValue) or not np.isnan(self.data_array._fill_value):
+          raise DataError('FillValue mismatch: {} != {}'.format(fillValue, self.data_array._fill_value)) # N.B.: NaN's are never equal           
     return fillValue
   @fillValue.setter
   def fillValue(self, fillValue):
     self.atts['fillValue'] = fillValue
     if self.data and self.masked:
-      self.data_array._fill_value = fillValue
       # I'm not sure which one does work, but this seems to work more reliably!
-#       self.data_array.set_fill_value = fillValue
-#       ma.set_fill_value(self.data_array,fillValue)
+      self.data_array._fill_value = np.asarray(fillValue) if fillValue is not None else None
+      # N.B.: Numpy MaskedArray's are very unreliable w.r.t. _fill_values; the set_fill_value methods do
+      #       not always seem to work, so setting it directly is more reliable; however, Numpy expects 
+      #       an array type as _fill_value, eventhough it just has one value
+      # self.data_array.set_fill_value = fillValue
+      # ma.set_fill_value(self.data_array,fillValue)
     
-  
+  def __eq__(self, other):
+    ''' test equality of variables based on meta data and data arrays; if compared with a string,
+        simply compare against the name of the Variable '''    
+    if self is other: return True # true identity -> trivial
+    elif isinstance(other, basestring): 
+      return self.name == other # special case for string input
+    elif isinstance(other, Variable): # variable comparison based on (meta-)data
+      return ( self.name == other.name and self.units == other.units and 
+               self.dtype == other.dtype and self.shape == other.shape and self.axes == other.axes and
+              ( not ( self.data and other.data ) or np.all(self.data_array == other.data_array) ) )
+    else: return False # default for other objects
+
   def __str__(self):
     ''' Built-in method; we just overwrite to call 'prettyPrint()'. '''
     return self.prettyPrint(short=False) # print is a reserved word  
@@ -579,7 +620,9 @@ class Variable(object):
   def hasAxis(self, axis, strict=True):
     ''' Check if the variable instance has a particular axis. '''
     if not strict and isinstance(axis,Variable): axis = axis.name
-    if isinstance(axis,basestring): # by name
+    if isinstance(axis,(int,np.integer)): # by index
+      if axis < self.ndim: return True
+    elif isinstance(axis,basestring): # by name
       for i in xrange(len(self.axes)):
         if self.axes[i].name == axis: return True
     elif isinstance(axis,Variable): # by name
@@ -588,8 +631,7 @@ class Variable(object):
     elif isinstance(axis,Variable): # by object ID
       for i in xrange(len(self.axes)):
         if self.axes[i] == axis: return True
-    # if all fails
-    return False
+    return False # if all fails
   
   def replaceAxis(self, oldaxis, newaxis=None):
     ''' Replace an existing axis with a different one with similar general properties. '''
@@ -611,19 +653,11 @@ class Variable(object):
     # return confirmation, i.e. True, if replacement was successful
     return self.hasAxis(newaxis)
 
-#   def __contains__(self, axis):
-#     ''' Check if the variable instance has a particular axis. '''
-#     # same as class method
-#     return self.hasAxis(axis)
-#   
-#   def __len__(self):
-#     ''' Return number of dimensions. '''
-#     return self.__dict__['ndim']
-
   @ApplyTestOverList
   def getAxis(self, axis, lcheck=True):
     ''' Return a reference to the Axis object or one with the same name. '''
-    lhas = self.hasAxis(axis)        
+    if isinstance(axis,(int,np.integer)): lhas = axis < self.ndim
+    else: lhas = self.hasAxis(axis)        
     if not lhas and lcheck:
       if isinstance(axis,Axis): axis = axis.name  
       raise AxisError, "Variable '{:s}' has no axis named '{:s}'".format(self.name,axis) 
@@ -634,7 +668,9 @@ class Variable(object):
   @ApplyTestOverList
   def axisIndex(self, axis, strict=True, lcheck=True):
     ''' Return the index of a particular axis. (return None if not found) '''
-    if isinstance(axis,basestring): # by name
+    if isinstance(axis,(int,np.integer)): # by index
+      return axis
+    elif isinstance(axis,basestring): # by name
       for i in xrange(len(self.axes)):
         if self.axes[i].name == axis: return i
     elif isinstance(axis,Axis): # by object ID
@@ -686,7 +722,7 @@ class Variable(object):
       else: self.data_array = data         
     
   def slicing(self, lidx=None, lrng=None, years=None, listAxis=None, asVar=None, lfirst=False, lminmax=False,
-              lsqueeze=True, lcheck=False, lcopy=False, lslices=False, linplace=False, **axes):
+              lsqueeze=True, lcheck=False, lcopy=False, lslices=False, linplace=False, lignoreEmpty=False, **axes):
     ''' This method implements access to slices via coordinate values and returns Variable objects. 
         Default behavior for different argument types: 
           - index by coordinate value, not array index, except if argument is a Slice object
@@ -701,7 +737,7 @@ class Variable(object):
       dataset = self.dataset 
       axes = axes.copy() # might be changed...
       for key,val in axes.iteritems():
-        if val is not None and dataset.hasVariable(key):
+        if val is not None and dataset.hasVariable(key) and not dataset.hasAxis(key):
           del axes[key] # remove pseudo axis
           var = dataset.getVariable(key)
           if isinstance(val,(tuple,list,np.ndarray)): 
@@ -709,15 +745,20 @@ class Variable(object):
           if var.ndim == 1: # possibly valid pseudo-axis!
             lpseudo = True
             coord = var.findValues(val, lidx=lidx, lfirst=lfirst, lminmax=lminmax, lflatten=False)          
-          else: raise AxisError, "Pseudo-axis can only have one axis!"
-          axes[var.axes[0].name] = coord # create new entry with actual axis
+          else: 
+            raise AxisError("Pseudo-axis can only have one axis!")
+          # see what we've got
+          if not lignoreEmpty and (isinstance(coord,np.ndarray) and coord.size == 0):
+            raise ValueError("Value '{}' not found in Variable '{}'!".format(val,key))
+          else:
+            axes[var.axes[0].name] = coord # create new entry with actual axis
           # N.B.: not that this automatically squeezes the pseudo-axis, since it is just a values...
         elif val is not None and dataset.hasAxis(key): lnonpseudo = True
       # pseudo-axes work with ranges, but return indices, and we can't mix ranges with indices!
       if lrng and lpseudo: 
         lrng = False
         if lnonpseudo: 
-          raise ArgumentError, "'lrng' was reset to False, but other variables are not yet processed."          
+          raise ArgumentError("'lrng' was reset to False, but other variables are not yet processed.")          
       
     # resolve special key words
     if years is not None:
@@ -734,7 +775,7 @@ class Variable(object):
         if isinstance(years,(int,float,np.integer,np.inexact)): 
           months = years*12 # if just a number, assume slicing from origin 
         elif isinstance(years,(list,tuple)): 
-          if '1979' in time.atts.long_name: offset = 1979 # convention...
+          if 'month since 1979' in time.atts.long_name.lower(): offset = 1979 # convention...
           else: offset = 0
           months = [(yr - offset)*12 for yr in years]
         else: raise NotImplementedError, years
@@ -751,7 +792,7 @@ class Variable(object):
         if 'long_name' not in year.atts: raise KeyError, self.prettyPrint(short=True)
         if lidx: raise ArgumentError, "Keyword 'years' only works with coordinate indexing, not direct indexing!"
         # convert years to time-axis coordinates
-        if '1979' in year.atts.long_name: offset = 1979
+        if 'month since 1979' in year.atts.long_name.lower(): offset = 1979
         else: offset = 0
         if isinstance(years,np.number): new_years = years - offset
         elif isinstance(years,(list,tuple)): new_years = [(yr - offset) for yr in years]
@@ -761,7 +802,7 @@ class Variable(object):
           else: raise NotImplementedError
         axes['year'] = new_years
       elif lcheck: 
-        raise AxisError, "Axis 'time' required for keyword 'years'!"
+        raise AxisError("Axis 'time' or 'year' required for keyword 'years'!")
       # N.B.: if lcheck is False, these keywords will just be ignored without a time-axis
     varaxes = dict(); idxmodes = dict() ; rngmodes = dict(); lstmodes = dict()
     # parse axes arguments and determine slicing
@@ -784,7 +825,7 @@ class Variable(object):
           rngmodes[key] = lrng
         lstmodes[key] = not rngmodes[key] and isinstance(val,(tuple,list,np.ndarray))
       elif lcheck: # default is to ignore axes that the variable doesn't have
-        raise AxisError, "Variable '{:s}' has no Axis '{:s}'.".format(self.name,key)
+        raise AxisError("Variable '{:s}' has no Axis '{:s}'.".format(self.name,key))
     ## create Slice tuple to slice data array and axes
     slcs = []; lists = [] # lists need special treatment
     # loop over axes of variable
@@ -796,19 +837,23 @@ class Variable(object):
           # values and ranges are in coordinate values
           # translate coordinate values into indices
           if isinstance(axval,(tuple,list,np.ndarray)): 
-            idxslc = [ax.getIndex(idx, outOfBounds=True) for idx in axval]
-            # expand ranges
-            if rngmod:
-              # coordinate values are inclusive, unlike indices
-              if idxslc[1] is not None: idxslc[1] += 1 
-              # out-of-bounds values (None) should be handled correctly by slice              
-              slcs.append(slice(*idxslc)) # use slice with index bounds 
-            else:
-              #idxslc = [idx for idx in idxslc if idx is not None] # remove out-of-bounds values              
-              slcs.append(idxslc) # use list of converted indices
+            if axval[0] > ax[-1] or axval[1] < ax[0]: 
+              raise AxisError, "Coordinate values {} are out of bounds for axis '{:s}'.".format(axval,ax.name)
+            else: 
+              idxslc = [ax.getIndex(idx, outOfBounds=True) for idx in axval]
+              # expand ranges
+              if rngmod:
+                # coordinate values are inclusive, unlike indices
+                if idxslc[1] is not None: idxslc[1] += 1 
+                # out-of-bounds values (None) should be handled correctly by slice              
+                slcs.append(slice(*idxslc)) # use slice with index bounds 
+              else:
+                #idxslc = [idx for idx in idxslc if idx is not None] # remove out-of-bounds values              
+                slcs.append(idxslc) # use list of converted indices
           else:
             idxslc = ax.getIndex(axval, outOfBounds=True)
-            if idxslc is None: raise AxisError, "Coordinate value {:s} out of bounds for axis '{:s}'.".format(str(axval),ax.name)  
+            if idxslc is None:
+              raise AxisError, "Coordinate value {:s} out of bounds for axis '{:s}'.".format(str(axval),ax.name)  
             slcs.append(idxslc)
         else:
           # values and ranges are indices
@@ -916,33 +961,37 @@ class Variable(object):
     # now load data       
     if data is None:
       if not self.data:
-        raise DataError, 'No data loaded and no external data supplied!'        
+        raise DataError('No data loaded and no external data supplied!')        
     else:   
       # check types   
-      if not isinstance(data,np.ndarray): raise TypeError, 'The data argument must be a numpy array!'
+      if len(self.axes) > 0 and not isinstance(data,np.ndarray): # allow scalars, but avoid safety checks
+          raise TypeError('The data argument must be a numpy array or a scalar!')        
       if self.dtype is None: self.dtype = data.dtype
       elif data.dtype == self.dtype: pass
       elif np.issubdtype(data.dtype, self.dtype): data = data.astype(self.dtype) 
       else: 
         if lrecast: data = data.astype(self.dtype)
-        else: raise DataError, "Dtypes of Variable and array are inconsistent."
+        else: raise DataError("Dtypes of Variable and array are inconsistent.")
       if np.issubdtype(data.dtype, np.inexact) and not isinstance(data, ma.masked_array):
         data = ma.masked_invalid(data, copy=False)     
-        data._fill_value = fillValue if fillValue is not None else self.fillValue
-#         ma.set_fill_value(data, fillValue if fillValue is not None else self.fillValue) # this seems to work more reliably!
+        data._fill_value = np.asarray(fillValue) if fillValue is not None else self.fillValue
+      # N.B.: Numpy MaskedArray's are very unreliable w.r.t. _fill_values; the set_fill_value methods do
+      #       not always seem to work, so setting it directly is more reliable; however, Numpy expects 
+      #       an array type as _fill_value, eventhough it just has one value
+      # ma.set_fill_value(data,self.atts['fillValue'])
+      # data.set_fill_value(self.atts['fillValue']) 
       # handle/apply mask
       if mask is not None: data = ma.array(data, mask=mask) 
       if isinstance(data,ma.MaskedArray): # figure out fill value for masked array
         if fillValue is not None: # override variable preset 
           if isinstance(fillValue,np.generic): fillValue = fillValue.astype(self.dtype)
           self.atts['fillValue'] = fillValue
-          data._fill_value =  fillValue
+          data._fill_value =  np.asarray(fillValue) if fillValue is not None else None
           # I'm not sure which one does work, but this seems to work more reliably!
         elif 'fillValue' in self.atts and self.atts['fillValue'] is not None: # use variable preset
-          data._fill_value = self.atts['fillValue'] 
+          fillValue = self.atts['fillValue']
+          data._fill_value =  np.asarray(fillValue) if fillValue is not None else None
           # I'm not sure which one does work, but this seems to work more reliably!
-#           ma.set_fill_value(data,self.atts['fillValue'])
-#           data.set_fill_value(self.atts['fillValue']) 
         else: # use data default
           self.atts['fillValue'] = data._fill_value if data._fill_value is not None else data.fill_value
         if self.atts['fillValue'] is None or not ( self.atts['fillValue'] == data._fill_value  
@@ -975,12 +1024,17 @@ class Variable(object):
     # self.__dict__['shape'] = None # retain shape for later use
     gc.collect() # enforce garbage collection
       
-  def getArray(self, idx=None, axes=None, broadcast=False, unmask=False, fillValue=None, copy=True):
+  def getArray(self, idx=None, axes=None, broadcast=False, unmask=False, fillValue=None, dtype=None, copy=True):
     ''' Copy the entire data array or a slice; option to unmask and to reorder/reshape to specified axes. '''
     # without data, this will fail
     if self.data:
-      if copy: datacopy = self.data_array.copy() # copy, if desired
-      else: datacopy = self.data_array 
+      if copy:
+        if dtype is not None:
+          datacopy = self.data_array.astype(dtype) # make a copy of new dtype 
+        else: datacopy = self.data_array.copy() 
+      else: 
+        if dtype is not None: raise ArgumentError(dtype)
+        datacopy = self.data_array 
       # unmask    
       if unmask and self.masked: 
         # N.B.: if no data is loaded, self.mask is usually false...
@@ -990,7 +1044,8 @@ class Variable(object):
       if axes is not None:
         if idx is not None: raise NotImplementedError
         for ax in self.axes:
-          assert (ax in axes) or (ax.name in axes), "Can not broadcast Variable '{:s}' to dimension '{:s}' ".format(self.name,ax.name)
+          if not ( (ax in axes) or (ax.name in axes) ):
+            raise AxisError("Need to have complete Axis list to broadcast; Axis '{:s}' in Variable '{:s}' is missing.".format(ax.name,self.name))
         # order dimensions as in broadcast axes list
         order = [self.axisIndex(ax) for ax in axes if self.hasAxis(ax)] # indices of broadcast list axes in instance axes list (self.axes)
         datacopy = np.transpose(datacopy,axes=order) # reorder dimensions to match broadcast list
@@ -1004,8 +1059,8 @@ class Variable(object):
         datacopy = datacopy.reshape(shape)
       # true broadcasting: extend array to match given axes and dimensions
       if broadcast:
-        assert all([isinstance(ax,Axis) and len(ax)>0 for ax in axes]),\
-           'All axes need to have a defined length in order broadcast the array.'
+        if not all([isinstance(ax,Axis) and len(ax)>0 for ax in axes]):
+          raise AxisError('All axes need to have a defined length in order broadcast the array.')
         # get tiling list
         tiling = [len(ax) if l == 1 else 1 for ax,l in zip(axes,datacopy.shape)]
         datacopy = np.tile(datacopy, reps=tiling)
@@ -1038,9 +1093,9 @@ class Variable(object):
         if self.masked: data.mask = ma.nomask # unmask, sort of...
       self.__dict__['data_array'] = ma.array(data, mask=mask)
     elif maskValue is not None:
-      if isinstance(self.dtype,(int,bool,np.integer,np.bool)): 
+      if np.issubdtype(self.dtype,np.integer) or np.issubdtype(self.dtype,np.bool): 
         self.__dict__['data_array'] = ma.masked_equal(self.data_array, maskValue, copy=False)
-      elif isinstance(self.dtype,(float,np.inexact)):
+      elif np.issubdtype(self.dtype,np.inexact):
         self.__dict__['data_array'] = ma.masked_values(self.data_array, maskValue, copy=False)
     # update fill value (stored in atts dict)
     self.fillValue = fillValue or ( self.data_array.fill_value if self.data_array._fill_value is None
@@ -1185,55 +1240,55 @@ class Variable(object):
   # ReduceVar(asVar=None, axis=None, axes=None, lcheckAxis=True, **slcaxes)
   
   @ReduceVar
-  def sum(self, data, axidx=None):
-    data = nf.nansum(data, axis=axidx)
+  def sum(self, data, axidx=None, keepdims=False):
+    data = nf.nansum(data, axis=axidx, keepdims=keepdims)
     name = '{:s}_sum'.format(self.name)
     units = self.units
     return data, name, units
   
   @ReduceVar
-  def mean(self, data, axidx=None):
-    data = nf.nanmean(data, axis=axidx)
+  def mean(self, data, axidx=None, keepdims=False):
+    data = nf.nanmean(data, axis=axidx, keepdims=keepdims)
     name = '{:s}_mean'.format(self.name)
     units = self.units
     return data, name, units
   
   @ReduceVar
-  def std(self, data, axidx=None, ddof=0):
-    data = nf.nanstd(data, axis=axidx, ddof=ddof) # ddof: degrees of freedom
+  def std(self, data, axidx=None, dof=None, ddof=0, keepdims=False):
+    data = nf.nanstd(data, axis=axidx, ddof=ddof, keepdims=keepdims) # ddof: degrees of freedom
     name = '{:s}_std'.format(self.name)
     units = self.units # variance has squared units    
     return data, name, units
  
   @ReduceVar
-  def sem(self, data, axidx=None, ddof=0):
-    data = nf.nansem(data, axis=axidx, ddof=ddof) # ddof: degrees of freedom
+  def sem(self, data, axidx=None, dof=None, ddof=0, keepdims=False):
+    data = nf.nansem(data, axis=axidx, ddof=ddof, keepdims=keepdims) # ddof: degrees of freedom
     name = '{:s}_sem'.format(self.name)
     units = self.units # variance has squared units    
     return data, name, units
   
   @ReduceVar
-  def var(self, data, axidx=None, ddof=0):
-    data = nf.nanvar(data, axis=axidx, ddof=ddof) # ddof: degrees of freedom
+  def var(self, data, axidx=None, dof=None, ddof=0, keepdims=False):
+    data = nf.nanvar(data, axis=axidx, ddof=ddof, keepdims=keepdims) # ddof: degrees of freedom
     name = '{:s}_var'.format(self.name)
     units = '({:s})^2'.format(self.units) # variance has squared units    
     return data, name, units
   
   @ReduceVar
-  def max(self, data, axidx=None):
-    data = nf.nanmax(data, axis=axidx)
+  def max(self, data, axidx=None, keepdims=False):
+    data = nf.nanmax(data, axis=axidx, keepdims=keepdims)
     name = '{:s}_max'.format(self.name)
     units = self.units
     return data, name, units
   
   @ReduceVar
-  def min(self, data, axidx=None):
-    data = nf.nanmin(data, axis=axidx)
+  def min(self, data, axidx=None, keepdims=False):
+    data = nf.nanmin(data, axis=axidx, keepdims=keepdims)
     name = '{:s}_min'.format(self.name)
     units = self.units
     return data, name, units
   
-  def reduce(self, operation, blklen=None, blkidx=None, axis=None, mode=None, offset=0, 
+  def reduce(self, operation, blklen=None, blkidx=None, axis=None, mode=None, 
                   asVar=None, axatts=None, varatts=None, fillValue=None, data_view=None,
                   lcheckVar=True, lcheckAxis=True, **kwargs):
     ''' Reduce a time-series; there are two modes:
@@ -1259,9 +1314,8 @@ class Variable(object):
       else: return None # just do nothing and return original Variable
     if isinstance(axis,basestring): axis = self.getAxis(axis)
     if not isinstance(axis,Axis): raise TypeError
-    axlen = len(axis); iax = self.axisIndex(axis)
-    # offset definition: start blocks at this index
-    if offset != 0: raise NotImplementedError
+    iax = self.axisIndex(axis)
+    axlen = len(axis) if data_view is None else data_view.shape[iax]; 
     # block definition
     if blklen is not None:
       if isinstance(blkidx,(list,tuple,np.ndarray)): 
@@ -1317,7 +1371,11 @@ class Variable(object):
       if 'coord' in raxatts:
         coord = raxatts.pop('coord') # use user-defiend coordinates 
       elif lblk: # use the beginning of each block as new coordinates (not divided by block length!) 
-        coord = oaxis.coord.reshape(nblks,blklen)[:,0].copy()
+        if axlen == len(oaxis):
+          coord = oaxis.coord.reshape(nblks,blklen)[:,0].copy()
+        else:
+          coord = np.arange(oaxis.coord[0]//blklen,oaxis.coord[-1]//blklen+1)*blklen
+        assert nblks == coord.size
       elif lperi or lall: # just enumerate block elements
         coord = np.arange(blklen) if blklen > 0 else None
       axes = list(self.axes)
@@ -1383,8 +1441,9 @@ class Variable(object):
       if self.masked: data = self.data_array.filled(fillValue)
       else: data = self.data_array
       # N.B.: to ignore masked values they have to be replaced by NaNs or out-of-bounds values 
-      hdata, bin_edges = np.histogram(data, bins=binedgs, **kwargs) # will flatten automatically
-      assert isEqual(bin_edges, binedgs)
+      #hdata, bin_edges = np.histogram(data, bins=binedgs, **kwargs) # will flatten automatically
+      #assert isEqual(bin_edges, binedgs)
+      hdata = histogram(data, bins=binedgs, **kwargs) # will flatten automatically
       assert hdata.shape == (len(binedgs)-1,)
       # create new Axis and Variable objects (1-D)
       if asVar: hvar = Variable(data=hdata, axes=(Axis(coord=bins, atts=axatts),), atts=varatts)
@@ -1404,7 +1463,7 @@ class Variable(object):
       # call reduce to perform operation
       axatts['coord'] = bins # reduce() reads this and uses it as new axis coordinates
       hvar = self.reduce(operation=histfct, blklen=len(bins), blkidx=None, axis=axis, mode='all', 
-                         offset=0, asVar=asVar, axatts=axatts, varatts=varatts, fillValue=fillValue)
+                         asVar=asVar, axatts=axatts, varatts=varatts, fillValue=fillValue)
     if asVar:
       if ldensity: hvar.plot = variablePlotatts['pdf'].copy()
       else: hvar.plot = variablePlotatts['hist'].copy()
@@ -1522,7 +1581,7 @@ class Variable(object):
       # call reduce to perform operation
       axatts['coord'] = qcoord # reduce() reads this and uses it as new axis coordinates
       qvar = self.reduce(operation=qfct, blklen=len(q), blkidx=None, axis=axis, mode='all', 
-                         offset=0, asVar=asVar, axatts=axatts, varatts=varatts, fillValue=fillValue)
+                         asVar=asVar, axatts=axatts, varatts=varatts, fillValue=fillValue)
 #     if asVar: qvar.plot = variablePlotatts[self.name].copy()
     # return new variable instance (or data)
     return qvar
@@ -1622,7 +1681,7 @@ class Variable(object):
         return pval
       # call reduce to perform operation
       pvar = var.reduce(operation=aaa_testfct, blklen=0, blkidx=None, axis=axis, mode='all', 
-                         offset=0, asVar=asVar, axatts=None, varatts=varatts, fillValue=fillValue)
+                         asVar=asVar, axatts=None, varatts=varatts, fillValue=fillValue)
     if asVar: pvar.plot = variablePlotatts['pval'].copy()
     # return new variable instance (or data)
     return pvar
@@ -1644,19 +1703,23 @@ class Variable(object):
     ''' helper function to check certain assumptions about the time axis '''
     time = self.getAxis(taxis); tcoord = time.coord
     # make sure the time axis is well-formatted, because we are making a lot of assumptions!
-    if not time.units.lower() in monthlyUnitsList: 
-      raise NotImplementedError, "Time units='month' required to extract seasons! (got '{:s}')".format(time.units)
-    #if 'long_name' not in time.atts and lstrictCheck: raise KeyError, time.prettyPrint(short=False)
-    if lbegin and ( (not lclim and tcoord[0]%12 != 0) or 
-                    (lclim and tcoord[0]%12 != 1) ): 
-      raise NotImplementedError, "Time-axis has to start in January; front-padding is currently not supported."
-    # TODO: implement front-padding in _getCompleteYears(); maybe return front offset here
+    if lclim:
+      if time.units.lower() in monthlyUnitsList: 
+        if np.any(tcoord != np.arange(1,13)): 
+          raise TimeAxisError("Invalid coordinate values for monthly climatology: {}".format(tcoord))
+      else:
+        raise TimeAxisError("Time units='month' required to extract seasons! (got '{:s}')".format(time.units))
+    else:
+      if 'long_name' in time.atts:
+        if not  'month since 1979-01' in time.atts['long_name'].lower(): 
+          raise TimeAxisError("Unable to determin time offset: {}".format(time.atts['long_name']))
+      else:    
+        raise TimeAxisError("Unable to determin time offset: {}".format(str(time)))
     if np.any( np.diff(tcoord, axis=0) != 1 ): 
-      raise NotImplementedError, "Time-axis cannot have missing coordinates (month)!"
-    # no return value - just throw exceptions
+      raise TimeAxisError("Time-axis cannot have missing coordinate values (month)!")
     
   def seasonalSample(self, season=None, asVar=True, lcheckAxis=False, lcheckVar=True, linplace=False, 
-                    lstrict=True, taxis='time', svaratts=None, saxatts=None):
+                     lstrict=True, loffset=True, taxis='time', svaratts=None, saxatts=None):
     ''' A method to extract a subset of month from a monthly timeseries and return a concatenated 
         time-series of values for the specified season. '''
     # check input
@@ -1665,6 +1728,8 @@ class Variable(object):
       if lstrict: self._checkMonthlyAxis(taxis=taxis, lbegin=True)
       # translate season string
       idx = translateSeasons(season) # does most of the remining input/type checking
+      # account for offset in coordinate axis: change indices
+      if loffset: idx -= int(tcoord[0]%12) # at which month we start counting
       # extend the list of indices to the length of the time axis
       idxlen = idx.size; tlen = tcoord.size; yrlen = tlen//12; tover = tlen%12
       # basically, construct a 2D array of years and month, and flatten afterwards
@@ -1695,42 +1760,53 @@ class Variable(object):
     # return results
     return svar
 
-  def _getCompleteYears(self, taxis='time', ltrim=False, lfront=False, lback=True, asVar=False, 
+  def _getCompleteYears(self, taxis='time', ltrim=False, lfront=True, lback=True, asVar=False, 
                         lcheck=True, lclim=False):
     ''' helper function that generates a trimmed or padded view of the data, either extending or 
         trimming the time axis ''' 
     if asVar: raise NotImplementedError, 'currently we can only return a bare array view, not a variable'
     # N.B.: to return a Variable, we would also have to trim/pad the time axis 
-    if lfront: raise NotImplementedError, 'currently we can only pad the back, not the front'
     time = self.getAxis(taxis); itime = self.axisIndex(taxis); tcoord = time.coord
     if lcheck: self._checkMonthlyAxis(taxis=taxis, lbegin=not lfront, lclim=lclim)
     # define new shape
-    tlen = tcoord.size; slen = tlen//12; tover = tlen%12 # determine dimension length
     if not self.data: raise DataError, 'Need to load data for trimming and padding.'
-    data_view = self.data_array
+    if lclim: offset = (tcoord[0]-1)%12; over = tcoord[-1]%12
+    else: offset = tcoord[0]%12; over = (tcoord[-1]+1)%12
+    tlen = tcoord.size; data_view = self.data_array; offset = int(offset); over = int(over)
+    if not lfront and offset > 0: 
+      warn('Front-padding disabled; setting offset to zero (offset={:d}'.format(offset))
+      offset = 0
+    if not lback and over > 0: 
+      warn('Back-padding disabled; setting overshoot to zero (over={:d}'.format(over))
+      over = 0
     # handle incomplete years
-    if tover > 0:
+    if offset > 0 or over > 0:
       if ltrim: 
-        data_view = data_view.take(range(tlen-tover), axis=itime) # only use complete years 
+        start = 0 if offset == 0 else 12 - offset; end = tlen - over
+        data_view = data_view.take(range(start,end), axis=itime) # only use complete years 
       else:
-        pshape = self.shape[:itime]+(12-tover,)+self.shape[itime+1:] # padding shape  
-        padding = np.ones(pshape)*self.fillValue # create padding using fillValue 
-        data_view = np.concatenate((data_view,padding), axis=itime) # append paddign array
-        if self.masked and data_view.mask: 
-          data_view.mask[...,tlen-tover:] = True # also mask pad, if applicable
-        slen += 1
+        front = self.shape[:itime]+(offset,)+self.shape[itime+1:] # shape/size for front padding  
+        frontpad = ma.ones(front, dtype=self.dtype) # create a masked array for padding 
+        frontpad *= frontpad.fill_value ; frontpad.mask = True
+        end = 0 if over == 0 else 12 - over # how much to add at the back
+        back = self.shape[:itime]+(end,)+self.shape[itime+1:] # shape/size for back padding
+        backpad = ma.ones(back, dtype=self.dtype) # create a masked array for padding 
+        backpad *= backpad.fill_value ; backpad.mask = True
+        if not isinstance(data_view, ma.MaskedArray): 
+          data_view = ma.asanyarray(data_view) # need masked arrays, so that pads can be masked
+        data_view = ma.concatenate((frontpad,data_view,backpad), axis=itime) # append padding array
     assert data_view.shape[itime]%12 == 0, data_view.shape # should be divisible by 12 now
     # return padded/trimmed view
     return data_view
   
-  def climSample(self, lstrict=True, ltrim=False, asVar=True, lcheckAxis=False, lcheckVar=True, linplace=False, 
+  def climSample(self, lstrict=True, ltrim=False, lpad=True, asVar=True, lcheckAxis=False, lcheckVar=True, linplace=False, 
                  taxis='time', saxis=None, saxatts=None, caxis=None, caxatts=None, svaratts=None):
     ''' A method to reshaped a Variable to a seasonal cycle axis and all samples (years) for each month
         along a new sample axis. '''    
     # check input
     if self.hasAxis(taxis):
       # get array view with complete years
-      data = self._getCompleteYears(taxis=taxis, ltrim=ltrim, asVar=False, lcheck=lstrict)
+      data = self._getCompleteYears(taxis=taxis, ltrim=ltrim, asVar=False, lcheck=lstrict, lfront=lpad, lback=lpad)
       time = self.getAxis(taxis); itime = self.axisIndex(taxis); tcoord = time.coord
       assert data.shape[itime]%12 == 0, data.shape # should be divisible by 12 now      
       # define new shape
@@ -1743,7 +1819,8 @@ class Variable(object):
       if asVar:
         if not caxis:
           # create new climatology axis
-          caxis = time.copy(coord=np.arange(1,13), atts=time.atts if caxatts is None else caxatts)
+          atts = time.atts if caxatts is None else caxatts
+          caxis = time.copy(coord=np.arange(1,13), atts=atts)
         else:
           if not isinstance(caxis, Axis): raise TypeError, caxis 
           if len(caxis) != 12: raise Axis, caxis
@@ -1769,7 +1846,7 @@ class Variable(object):
     # return results
     return svar
   
-  def reduceToAnnual(self, season, operation, asVar=False, name=None, offset=0, taxis='time', 
+  def reduceToAnnual(self, season, operation, asVar=False, name=None, taxis='time', 
                      checkUnits=True, lcheckVar=True, lcheckAxis=True, taxatts=None, varatts=None, 
                      mean_list=None, ltrim=False, lstrict=True, lclim=False, **kwargs):
     ''' Reduce a monthly time-series to an annual time-series, using mean/min/max over a subset of month or seasons. '''
@@ -1780,13 +1857,8 @@ class Variable(object):
       if lcheckVar: raise VariableError, "Seasonal reduction does not work with string Variables!"
       else: return None
     data_view = self._getCompleteYears(taxis=taxis, ltrim=ltrim, asVar=False, lcheck=lstrict, lclim=lclim)
-    taxis = self.getAxis(taxis); te = len(taxis); tax = self.axisIndex(taxis.name)
-    assert data_view.shape[self.axisIndex(taxis)]%12 == 0, data_view.shape # should be divisible by 12 now          
-#     if checkUnits and not taxis.units.lower() in monthlyUnitsList: 
-#       raise AxisError, "Seasonal reduction requires monthly data! (time units: '{:s}')".format(taxis.units)
-#     te = len(taxis); tax = self.axisIndex(taxis.name)
-#     if te%12 != 0 or not (taxis.coord[0]%12 == 0 or taxis.coord[0]%12 == 1): 
-#       raise NotImplementedError, 'Currently seasonal reduction only works with full years.'
+    taxis = self.getAxis(taxis); tax = self.axisIndex(taxis.name); te = data_view.shape[tax]
+    assert te%12 == 0, data_view.shape # should be divisible by 12 now          
     # hadling of exceptions: some variables in Datasets should only be averaged
     if mean_list is not None and self.name in mean_list: operation = np.nanmean    
     # modify variable
@@ -1807,7 +1879,7 @@ class Variable(object):
     # translate definiton of month or season
     idx = translateSeasons(season)
     # call general reduction function
-    avar =  self.reduce(operation, blklen=12, blkidx=idx, axis=taxis, mode='block', offset=offset, 
+    avar =  self.reduce(operation=operation, blklen=12, blkidx=idx, axis=taxis, mode='block',
                         asVar=asVar, axatts=tatts, varatts=varatts, data_view=data_view, 
                         lcheckVar=lcheckVar, lcheckAxis=lcheckAxis, **kwargs)
     # check shape of annual variable
@@ -1850,7 +1922,7 @@ class Variable(object):
     ''' Return a time-series of annual averages of the specified season. '''    
     return self.reduceToAnnual(season=season, operation=nf.nanmin, **kwargs)
   
-  def reduceToClimatology(self, operation, yridx=None, asVar=True, name=None, offset=0, taxis='time', 
+  def reduceToClimatology(self, operation, yridx=None, asVar=True, name=None, taxis='time', 
                           lcheckVar=True, lcheckAxis=True, checkUnits=True, taxatts=None, varatts=None, 
                           mean_list=None, ltrim=False, lstrict=True, **kwargs):
     ''' Reduce a monthly time-series to an annual climatology; use 'yridx' to limit the reduction to 
@@ -1864,18 +1936,12 @@ class Variable(object):
     data_view = self._getCompleteYears(taxis=taxis, ltrim=ltrim, asVar=False, lcheck=lstrict)
     taxis = self.getAxis(taxis); tax = self.axisIndex(taxis.name)
     assert data_view.shape[self.axisIndex(taxis)]%12 == 0, data_view.shape # should be divisible by 12 now          
-#     taxis = self.getAxis(taxis)    
-#     if checkUnits and not taxis.units.lower() in monthlyUnitsList: 
-#       raise AxisError, "Reduction to climatology requires monthly data! (time units: '{:s}')".format(taxis.units)
-#     te = len(taxis); tax = self.axisIndex(taxis.name)
-#     if te%12 != 0 or not (taxis.coord[0]%12 == 0 or taxis.coord[0]%12 == 1): 
-#       raise NotImplementedError, 'Currently reduction to climatology only works with full years.'
     # hadling of exceptions: some variables in Datasets should only be averaged
     if mean_list is not None and self.name in mean_list: operation = np.nanmean    
     # modify variable
     if asVar:      
       # create new time axis (still monthly)
-      tatts = self.time.atts.copy()
+      tatts = taxis.atts.copy()
       if taxatts is not None: tatts.update(taxatts)      
       # create new variable
       vatts = self.atts.copy()
@@ -1885,8 +1951,8 @@ class Variable(object):
       if varatts is not None: vatts.update(varatts)
     else: tatts = None; varatts = None # irrelevant
     # call general reduction function
-    avar =  self.reduce(operation, blklen=12, blkidx=yridx, axis=taxis, mode='periodic',
-                        offset=offset, asVar=asVar, axatts=tatts, varatts=varatts, 
+    avar =  self.reduce(operation=operation, blklen=12, blkidx=yridx, axis=taxis, mode='periodic',
+                        asVar=asVar, axatts=tatts, varatts=varatts, data_view=data_view, 
                         lcheckVar=lcheckVar, lcheckAxis=lcheckAxis, **kwargs)
     # check shape of annual variable
     assert avar.shape == self.shape[:tax]+(12,)+self.shape[tax+1:]
@@ -1972,7 +2038,7 @@ class Variable(object):
           raise DatasetError, "Dataset '{:s}' does not have Axis '{:s}'.".format(ds.name,
                                                       ax.name if isinstance(ax,Axis) else ax)
       axes = tmp_axes
-    # check axes determin reordering
+    # check axes amd determine reordering
     if len(axes) == 0: lcheck = False
     elif lvarall: lcheck = all(self.hasAxis(ax, strict=lstrict) for ax in axes)
     else: lcheck = any(self.hasAxis(ax, strict=lstrict) for ax in axes)
@@ -2013,8 +2079,8 @@ class Variable(object):
           if axatts is not None: satts.update(axatts) 
           new_axis = Axis(coord=np.arange(nlen), atts=satts)
         else:
-          if not isinstance(new_axis,Axis): raise TypeError, new_axis
-          if not len(new_axis)==nlen: raise AxisError, new_axis 
+          if not isinstance(new_axis,Axis): raise TypeError(new_axis)
+          if not len(new_axis)==nlen: raise AxisError(new_axis) 
         varatts = {new_axis.name:tuple(ax.name if isinstance(ax,Axis) else ax for ax in axes)} # save merge history
         axes = var.axes[:imin]+(new_axis,)+var.axes[imin+mdim:] # finally, assemble new axes
         var = var._createVar(axes=axes, data=data, linplace=True, atts=varatts) # already made a copy
@@ -2352,28 +2418,46 @@ class Axis(Variable):
     # initialize dimensions
     if axes is None: axes = (self,)
     elif not isinstance(axes,(list,tuple)) and len(axes) == 1:
-      raise ArgumentError
-#     axes = (self,)
+      raise ArgumentError(axes)
     # N.B.: Axis objects carry a circular reference to themselves in the dimensions tuple
-    if coord is not None: 
+    data = varargs.pop('data',None)
+    if coord is not None: # coord has precedence
+      varargs.pop('dtype',None) # should be determined from data
       data = self._transformCoord(coord)
       if length > 0:
-        if data.size != length: raise AxisError, "Specified length and coordinate vector are incompatible!"
+        if data.size != length: 
+          raise AxisError("Specified length and coordinate vector are incompatible!")
       else: length = data.size
-    else: data = None
     self.__dict__['_len'] = length
     # initialize as a subclass of Variable, depending on the multiple inheritance chain    
-    super(Axis, self).__init__(axes=axes, data=data, **varargs)
+    super(Axis, self).__init__(axes=axes, data=None, **varargs)
     # add coordinate vector
     if data is not None: 
       self.coord = data
       assert self.data == True
     # determine direction of ascend
     if self.coord is not None:
-      if all(np.diff(self.coord) > 0): self.ascending = True
-      elif all(np.diff(self.coord) < 0): self.ascending = False
-#       else: self.ascending = None
-      else: raise AxisError, "Coordinates must be strictly monotonically increasing or decreasing."
+      # special handling for datetime...
+      if np.issubdtype(self.coord.dtype,np.datetime64):
+          time_coord = ( self.coord.astype('datetime64[s]') - self.coord[0].astype('datetime64[s]') ) / np.timedelta64(1,'s')     
+      else: time_coord = self.coord
+      # check differences (does ot work with datetime64)
+      if all(np.diff(time_coord) > 0): self.ascending = True
+      elif all(np.diff(time_coord) < 0): self.ascending = False
+      else: 
+        raise AxisError("Coordinates must be strictly monotonically increasing or decreasing.")
+
+  def __eq__(self, other):
+    ''' test equality of axes based on meta data and coordinate values; if compared with a string,
+        simply compare against the name of the Axis '''    
+    if self is other: return True # true identity -> trivial
+    elif isinstance(other, basestring): 
+      return self.name == other # special case for string input
+    elif isinstance(other, Axis): # axes comparison based on (meta-)data
+      return ( self.name == other.name and self.units == other.units and 
+               self.dtype == other.dtype and self.len == other.len and 
+               ( not ( self.data and other.data ) or np.all(self.coord == other.coord) ) )
+    else: return False # default for other objects
 
   def _transformCoord(self, data):
     ''' a coordinate vector will be converted, based on input conventions '''
@@ -2390,7 +2474,7 @@ class Axis(Variable):
       else: data = self.data_array
       # N.B.: this is necessary to prevent shrinking of the coordinate vector after successive slicing
     else: #data = data
-      raise TypeError, 'Data type not supported for coordinate values.'
+      raise TypeError('Data type not supported for coordinate values: {}'.format(data))
     return data
 
   @property
@@ -2415,13 +2499,13 @@ class Axis(Variable):
   def len(self):
     ''' The length of the axis; if a coordinate vector is present, it is the length of that vector. '''
     if self.data and self._len != self.coord.size: 
-      raise AxisError, "Length of axis '{:s}' and coordinate size do not match!".format(self.name)
+      raise AxisError("Length of axis '{:s}' and coordinate size do not match!".format(self.name))
     return self._len    
   @len.setter
   def len(self, length):
     ''' Update the length, or check for conflict if a coordinate vector is present. (Default length is 0)'''
     if self.data and length != self.coord.size:
-      raise AxisError, 'Axis instance \'{:s}\' already has a coordinate vector of length {:d} ({:d} given)'.format(self.name,len(self),length)        
+      raise AxisError('Axis instance \'{:s}\' already has a coordinate vector of length {:d} ({:d} given)'.format(self.name,len(self),length))
     self._len = length
   
   def __len__(self):
@@ -2557,7 +2641,9 @@ class Dataset(object):
     if atts: self.__dict__['atts'] = AttrDict(**atts)
     else: self.__dict__['atts'] = AttrDict()
     # add explicitly passed axes
-    if axes: assert self.addAxis(axes, copy=False, lall=True)
+    if axes: 
+      if isinstance(axes,dict): axes = axes.values()
+      assert self.addAxis(axes, copy=False, lall=True)
     # load variables (automatically adds axes linked to variables)
     if varlist is None: varlist = []
     # add variables (ApplyTestOverList-decorator takes care of iteration)
@@ -2592,7 +2678,7 @@ class Dataset(object):
   @ApplyTestOverList
   def addAxis(self, ax, copy=False, loverwrite=False):
     ''' Method to add an Axis to the Dataset. If the Axis is already present, check that it is the same. '''
-    if not isinstance(ax,Axis): raise TypeError
+    if not isinstance(ax,Axis): raise TypeError(ax)
     if not self.hasAxis(ax.name): # add new axis, if it does not already exist        
       if ax.name in self.__dict__: 
         raise AttributeError, "Cannot add Axis '{:s}' to Dataset, because an attribute of the same name already exits!".format(ax.name)
@@ -2636,7 +2722,7 @@ class Dataset(object):
       for ax in var.axes: 
         if not self.hasAxis(ax.name):
           self.addAxis(ax, copy=copy) # add new axis          
-        elif ax is not self.axes[ax.name]:
+        if ax is not self.axes[ax.name]:
           var.replaceAxis(ax, self.axes[ax.name]) # or use old one of the same name
         # N.B.: replacing the axes in the variable is to ensure consistent axes within the dataset 
       # finally, if everything is OK, add variable
@@ -2721,12 +2807,12 @@ class Dataset(object):
     ''' Remove singleton axes from all variables; return axes that were entirely removed. '''
     axes = set()
     # squeeze variables
-    for var in self.variable.values():
+    for var in self.variables.values():
       var.squeeze() # get axes that were removed
       axes.add(var.axes) # collect axes that are still needed
     # remove axes that are no longer needed
     retour = []
-    for ax in self.axes:
+    for ax in self.axes.values():
       if ax not in axes: 
         self.removeAxis(ax)
         retour.append(ax)        
@@ -2740,8 +2826,8 @@ class Dataset(object):
       return self.variables.has_key(var) # look up by name
     elif isinstance(var,Variable):
       if self.variables.has_key(var.name):
-        if strict: return self.variables[var.name] is var # verify identity
-        return True # name found and identity verified 
+        # name found and identity verified 
+        return not strict or self.variables[var.name] is var
       else: return False # not found
     else: # invalid input
       raise DatasetError, "Need a Variable instance or name to check for a Variable in the Dataset!"
@@ -2780,7 +2866,7 @@ class Dataset(object):
       else: return None
       
   def slicing(self, lidx=None, lrng=None, lminmax=False, lsqueeze=True, lcopy=False, years=None, lfirst=False, 
-               listAxis=None, lrmOther=False, lcpOther=False, **axes):
+               listAxis=None, lrmOther=False, lcpOther=False, lignoreEmpty=False, **axes):
     ''' This method implements access to slices via coordinate values and returns a Dataset object; the 
         method relies on the Variable method for actual slicing but preserves the dataset integrity.
         Default behavior for different argument types: 
@@ -2802,10 +2888,17 @@ class Dataset(object):
         del axes[key] # remove pseudo axis
         var = self.getVariable(key)
         if var.ndim == 1: # possibly valid pseudo-axis!
+          lpseudo = True
           coord = var.findValues(val, lidx=lidx, lfirst=lfirst, lminmax=lminmax, lflatten=False)          
-        else: raise AxisError, "Pseudo-axis can only have one axis!"
-        axes[var.axes[0].name] = coord # create new entry with actual axis
+        else: 
+          raise AxisError("Pseudo-axis can only have one axis!")
+        # see what we've got
+        if not lignoreEmpty and (isinstance(coord,np.ndarray) and coord.size == 0):
+          raise ValueError("Value '{}' not found in Variable '{}'!".format(val,key))
+        else:
+          axes[var.axes[0].name] = coord # create new entry with actual axis
         # N.B.: not that this automatically squeezes the pseudo-axis, since it is just a values...
+      elif val is not None and self.hasAxis(key): lnonpseudo = True
     # pseudo-axes work with ranges, but return indices, and we can't mix ranges with indices!
     if lrng and lpseudo: 
       lrng = False
@@ -2824,11 +2917,14 @@ class Dataset(object):
                      lcopy=False, years=years, listAxis=listAxis, **axes)    
         # convert to Python scalar (of sorts)
         if isinstance(attval,np.ndarray):
-          if np.issubdtype(attval.dtype, np.str): attval = str(attval).rstrip()    
+          if np.issubdtype(attval.dtype, np.str): attval = str(attval).rstrip()
+          elif np.issubdtype(attval.dtype, np.unicode): attval = str(attval).rstrip()
+          elif np.issubdtype(attval.dtype, basestring): attval = str(attval).rstrip()    
           elif np.issubdtype(attval.dtype, np.integer): attval = int(attval)
           elif np.issubdtype(attval.dtype, np.float): attval = float(attval)
           else: raise TypeError, attval
         singlevaratts[var.name] = attval
+        np.unicode
       else:
         # properly slice variable
         newvar = var(lidx=lidx, lrng=lrng, asVar=True, lcheck=False, lsqueeze=lsqueeze, 
@@ -2983,13 +3079,25 @@ class Dataset(object):
     return Dataset(name=name,title=title,varlist=varlist,atts=atts)
     
   def __iadd__(self, var):
-    ''' Add a Variable to an existing dataset. '''      
-    assert self.addVariable(var), "A problem occurred adding Variable '{:s}' to Dataset.".format(var.name)    
+    ''' Add a Variable to an existing dataset. ''' 
+    if isinstance(var,Axis):
+      if not self.addAxis(var):
+        raise AxisError("A problem occurred adding Axis '{:s}' to Dataset.".format(var.name))
+    elif isinstance(var,Variable):
+      if not self.addVariable(var):
+        raise VariableError("A problem occurred adding Variable '{:s}' to Dataset.".format(var.name))
+    else: raise DatasetError("Object '{}' cannot be added to Dataset.".format(var))
     return self # return self as result
 
   def __isub__(self, var):
     ''' Remove a Variable to an existing dataset. '''      
-    assert self.removeVariable(var), "A proble occurred removing Variable '{:s}' from Dataset.".format(var.name)
+    if isinstance(var,Axis):
+      if not self.removeAxis(var):
+        raise AxisError("A proble occurred removing Axis '{:s}' from Dataset.".format(var.name))
+    elif isinstance(var,Variable):
+      if not self.removeVariable(var):
+        raise VariableError("A problem occurred removing Variable '{:s}' from Dataset.".format(var.name))
+    else: raise DatasetError("Object '{}' cannot be removed from Dataset.".format(var))
     return self # return self as result
   
   def load(self, **kwargs):
@@ -3064,6 +3172,8 @@ class Dataset(object):
         on all Variables using _apply_to_all '''
     # N.B.: this method is only called as a fallback, if no class/instance attribute exists,
     #       i.e. Dataset methods and attributes will always have precedent 
+    if len(self.variables) == 0: 
+      raise EmptyDatasetError("Unable to to apply request to Variables; Dataset empty: \n{:s}".format(str(self)))
     # check if Variables have this attribute
     if any([hasattr(var,attr) for var in self.variables.itervalues()]):
       # get all attributes into a dict, using None if not present
@@ -3191,7 +3301,7 @@ def concatVars(variables, axis=None, coordlim=None, idxlim=None, asVar=True, off
     vatts = var0.atts.copy()
     vatts['name'] = name or var0.name; vatts['units'] = units or var0.units
     if varatts is not None: vatts.update(varatts)
-    return Variable(data=data, axes=axes, atts=vatts)
+    return var0.copy(data=data, axes=axes, atts=vatts)
     # or return data
   else: return data
   
@@ -3340,15 +3450,15 @@ class Ensemble(object):
     self.idkeys = []
     for member in self.members:
       memid = getattr(member, self.idkey)
-      self.idkeys.append(memid)
       if not isinstance(memid, basestring): raise TypeError, "Member ID key '{:s}' should be a string-type, but received '{:s}'.".format(str(memid),memid.__class__)
       if memid in self.__dict__:
-        raise AttributeError, "Cannot overwrite existing attribute '{:s}'.".format(memid)
+        raise AttributeError, "Cannot overwrite existing attribute '{:s}'\n({}).".format(memid,self.idkeys)
+      self.idkeys.append(memid)
       self.__dict__[memid] = member
       
   def _recastList(self, fs):
     ''' internal helper method to decide if a list or Ensemble should be returned '''
-    if all(f is None for f in fs): return # suppress list of None's
+    if all(f is None for f in fs): return None # suppress list of None's
     elif all([not callable(f) and not isinstance(f, (Variable,Dataset)) for f in fs]): return fs  
     elif all([isinstance(f, (Variable,Dataset)) for f in fs]):
       # N.B.: technically, Variable instances are callable, but that's not what we want here...
@@ -3470,6 +3580,14 @@ class Ensemble(object):
     self.__dict__[getattr(member,self.idkey)] = member
     return self.hasMember(member)
   
+  def insertMember(self, i, member):
+    ''' insert a new member at location 'i' '''
+    if not isinstance(member, self.basetype): 
+      raise TypeError, "Ensemble members have to be of '{:s}' type; received '{:s}'.".format(self.basetype.__name__,member.__class__.__name__)       
+    self.members.insert(i,member)
+    self.__dict__[getattr(member,self.idkey)] = member
+    return self.hasMember(member)
+  
   def removeMember(self, member):
     ''' remove a member from the ensemble '''
     if not isinstance(member, (self.basetype,basestring)): 
@@ -3487,36 +3605,36 @@ class Ensemble(object):
     # return check
     return not self.hasMember(member)
   
-  def __mul__(self, n):
-    ''' how to combine with other objects '''
-    if isInt(n):
-      return self.members*n
-    else:
-      raise TypeError
-
-  def __add__(self, other):
-    ''' how to combine with other objects '''
-    if isinstance(other, Ensemble):
-      for member in other: self.addMember(member)
-      return self
-    elif isinstance(other, list):
-      return self.members + other
-    elif isinstance(other, tuple):
-      return tuple(self.members) * other
-    else:
-      raise TypeError
-
-  def __radd__(self, other):
-    ''' how to combine with other objects '''
-    if isinstance(other, Ensemble):
-      for member in other: self.addMember(member)
-      return self
-    elif isinstance(other, list):
-      return other + self.members
-    elif isinstance(other, tuple):
-      return other + tuple(self.members)
-    else:
-      raise TypeError
+#   def __mul__(self, n):
+#     ''' how to combine with other objects '''
+#     if isInt(n):
+#       return self.members*n
+#     else:
+#       raise TypeError
+# 
+#   def __add__(self, other):
+#     ''' how to combine with other objects '''
+#     if isinstance(other, Ensemble):
+#       for member in other: self.addMember(member)
+#       return self
+#     elif isinstance(other, list):
+#       return self.members + other
+#     elif isinstance(other, tuple):
+#       return tuple(self.members) * other
+#     else:
+#       raise TypeError
+# 
+#   def __radd__(self, other):
+#     ''' how to combine with other objects '''
+#     if isinstance(other, Ensemble):
+#       for member in other: self.addMember(member)
+#       return self
+#     elif isinstance(other, list):
+#       return other + self.members
+#     elif isinstance(other, tuple):
+#       return other + tuple(self.members)
+#     else:
+#       raise TypeError
 
   def __getitem__(self, item):
     ''' Yet another way to access members by name... conforming to the container protocol. 
@@ -3534,9 +3652,9 @@ class Ensemble(object):
           # N.B.: this is useful to load different Variables from Datasets by name, 
           #       without having to use getattr()
         except AttributeError:
-          if self.basetype is Dataset: raise DatasetError, item
-          elif self.basetype is Variable: raise VariableError, item
-          else: raise AttributeError, item
+          if self.basetype is Dataset: raise DatasetError(item)
+          elif self.basetype is Variable: raise VariableError(item)
+          else: raise AttributeError(item)
         #return self.__getattr__(item) # call like an attribute
     elif isinstance(item, (int,np.integer,slice)):
       # access members like list/tuple 
@@ -3574,22 +3692,31 @@ class Ensemble(object):
   
   def __iadd__(self, member):
     ''' Add a Dataset to an existing Ensemble. '''
+    ec = False # confirm that everything worked
     if isinstance(member, self.basetype):
-      assert self.addMember(member), "A problem occurred adding Dataset '{:s}' to Ensemble.".format(member.name)    
-    elif isinstance(member, Variable):
-      assert all(self.addVariable(member)), "A problem occurred adding Variable '{:s}' to Ensemble Members.".format(member.name)    
-    elif all([isinstance(m, Variable) for m in member]):
-      assert all(self.addVariable(member)), "A problem occurred adding Variable '{:s}' to Ensemble Members.".format(member.name)    
+        ec = self.addMember(member) 
+    elif isinstance(member,(Ensemble,list,tuple)) and all([isinstance(m, self.basetype) for m in member]):
+        for m in member: ec = self.addMember(m)
+    elif self.basetype is Dataset:    
+        if isinstance(member, Variable):
+            ec = all(self.addVariable(member))
+        elif isinstance(member,(Ensemble,list,tuple)) and all([isinstance(m, Variable) for m in member]):
+            ec = all(self.addVariable(member))
+    if not ec: 
+        raise EnsembleError("A problem occurred adding '{:s}' to Ensemble.".format(member.name))
     return self # return self as result
 
   def __isub__(self, member):
-    ''' Remove a Dataset to an existing Ensemble. '''      
+    ''' Remove a Dataset to an existing Ensemble. '''
+    ec = False # confirm that everything worked
     if isinstance(member, basestring) and self.hasMember(member):
-      assert self.removeMember(member), "A proble occurred removing Dataset '{:s}' from Ensemble.".format(member)    
+        ec = self.removeMember(member)    
     elif isinstance(member, self.basetype):
-      assert self.removeMember(member), "A proble occurred removing Dataset '{:s}' from Ensemble.".format(member.name)
+        ec = self.removeMember(member)
     elif isinstance(member, (basestring,Variable)):
-      assert all(self.removeVariable(member)), "A problem occurred removing Variable '{:s}' from Ensemble Members.".format(member.name)    
+        ec = all(self.removeVariable(member))
+    if not ec:
+        raise EnsembleError("A problem occurred removing Variable '{:s}' from Ensemble Members.".format(member.name))    
     return self # return self as result
 
   

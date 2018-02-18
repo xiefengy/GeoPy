@@ -14,14 +14,14 @@ from geodata.base import Axis
 from geodata.netcdf import DatasetNetCDF
 from geodata.gdal import addGDALtoDataset, getProjFromDict, GridDefinition
 from geodata.misc import DatasetError 
-from datasets.common import translateVarNames, name_of_month, data_root, loadObservations, grid_folder
+from datasets.common import translateVarNames, name_of_month, getRootFolder, loadObservations, grid_folder
 from processing.process import CentralProcessingUnit
 
 
 ## NARR Meta-data
 
 dataset_name = 'NARR'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # long-term mean folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 
 # NARR projection
 projdict = dict(proj  = 'lcc', # Lambert Conformal Conic  
@@ -230,9 +230,9 @@ if __name__ == '__main__':
     
   
 #   mode = 'test_climatology'
-  mode = 'test_timeseries'
+#   mode = 'test_timeseries'
 #   mode = 'test_point_climatology'
-#   mode = 'test_point_timeseries'
+  mode = 'test_point_timeseries'
 #   mode = 'average_timeseries'
 #   mode = 'convert_climatology'
   grid = None
@@ -242,7 +242,7 @@ if __name__ == '__main__':
   period = (1979,1994)
 #   period = (1979,2009)
 #   period = (2010,2011)
-  pntset = 'shpavg' # 'ecprecip'
+  pntset = 'glbshp' # 'ecprecip'
   
   if mode == 'test_climatology':
     
@@ -273,7 +273,7 @@ if __name__ == '__main__':
     
     # load station time-series file
     print('')
-    if pntset in ('shpavg',): dataset = loadNARR_Shp(shape=pntset, period=period)
+    if pntset in ('shpavg','glakes','glbshp'): dataset = loadNARR_Shp(shape=pntset, period=period)
     else: dataset = loadNARR_Stn(station=pntset, period=period)
     print(dataset)
     print('')
@@ -286,11 +286,14 @@ if __name__ == '__main__':
     print('')
     if pntset in ('shpavg',): dataset = loadNARR_ShpTS(shape=pntset)
     else: dataset = loadNARR_StnTS(station=pntset)
+    #dataset = dataset.load().climMean()
     print(dataset)
     print('')
     print(dataset.time)
     print(dataset.time.coord)
     assert dataset.time.coord[0] == 0 # Jan 1979
+    print('')
+    print(dataset.shape_name[:])
 
 
   elif mode == 'convert_climatology':      

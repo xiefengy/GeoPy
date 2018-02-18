@@ -15,22 +15,20 @@ from datetime import datetime
 import logging   
 from collections import OrderedDict
 # internal imports
-from geodata.misc import DateError, printList
+from geodata.misc import DateError, DatasetError, printList
 from geodata.netcdf import DatasetNetCDF
 from geodata.base import Dataset
 from datasets import gridded_datasets
-from processing.misc import getMetaData, getTargetFile, getExperimentList, loadYAML
+from processing.misc import getMetaData, getTargetFile, getExperimentList, loadYAML,\
+  getProjectVars
 from processing.multiprocess import asyncPoolEC
 from processing.process import CentralProcessingUnit
-
-# import shape objects
-from datasets.WSC import basins
-from datasets.EC import provinces
 
 
 # worker function that is to be passed to asyncPool for parallel execution; use of the decorator is assumed
 def performShapeAverage(dataset, mode, shape_name, shape_dict, dataargs, loverwrite=False, varlist=None, 
-                        lwrite=True, lreturn=False, ldebug=False, lparallel=False, pidstr='', logger=None):
+                        lwrite=True, lreturn=False, lappend=False,
+                        ldebug=False, lparallel=False, pidstr='', logger=None):
   ''' worker function to extract point data from gridded dataset '''  
   # input checking
   if not isinstance(dataset,basestring): raise TypeError
@@ -55,8 +53,7 @@ def performShapeAverage(dataset, mode, shape_name, shape_dict, dataargs, loverwr
   dataset_name = dataargs.dataset_name; periodstr = dataargs.periodstr; avgfolder = dataargs.avgfolder
             
   # get filename for target dataset and do some checks
-  filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, 
-                           grid=shape_name, period=None, filetype=None) 
+  filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, shape=shape_name) 
     
   if ldebug: filename = 'test_' + filename  
   if not os.path.exists(avgfolder): raise IOError, "Dataset folder '{:s}' does not exist!".format(avgfolder)  
@@ -76,7 +73,7 @@ def performShapeAverage(dataset, mode, shape_name, shape_dict, dataargs, loverwr
         # if source file is newer than sink file or if sink file is a stub, recompute, otherwise skip
         if age > srcage and os.path.getsize(filepath) > 1e4: lskip = True
         # N.B.: NetCDF files smaller than 10kB are usually incomplete header fragments from a previous crashed
-      if not lskip: os.remove(filepath) # recompute
+
   
   # depending on last modification time of file or overwrite setting, start computation, or skip
   if lskip:        
@@ -86,6 +83,8 @@ def performShapeAverage(dataset, mode, shape_name, shape_dict, dataargs, loverwr
     logger.info(skipmsg)              
   else:
               
+    if lappend: raise NotImplementedError
+    
     ## actually load datasets
     source = loadfct() # load source 
     # check period
@@ -131,7 +130,7 @@ def performShapeAverage(dataset, mode, shape_name, shape_dict, dataargs, loverwr
       logger.info(writemsg)      
       
       # rename file to proper name
-      if not lreturn:
+      if not lreturn and not lappend:
         sink.unload(); sink.close(); del sink # destroy all references 
         if os.path.exists(filepath): os.remove(filepath) # remove old file
         os.rename(tmpfilepath,filepath)
@@ -173,6 +172,7 @@ if __name__ == '__main__':
     # read config object
     NP = NP or config['NP']
     loverwrite = config['loverwrite']
+    lappend = config['lappend']
     # source data specs
     modes = config['modes']
     varlist = config['varlist']
@@ -180,6 +180,7 @@ if __name__ == '__main__':
     # Datasets
     datasets = config['datasets']
     resolutions = config['resolutions']
+    unity_grid = config.get('unity_grid',None)
     lLTM = config['lLTM']
     # CESM
     CESM_project = config['CESM_project']
@@ -191,14 +192,16 @@ if __name__ == '__main__':
     WRF_experiments = config['WRF_experiments']
     WRF_filetypes = config['WRF_filetypes']
     domains = config['domains']
+    grid = config.get('grid',None)
     # target data specs
     shape_name = config['shape_name']
     shapes = config['shapes']
   else:
 #     NP = 1 ; ldebug = True # for quick computations
-    NP = 3 ; ldebug = False # for quick computations
-#     modes = ('time-series',) # 'climatology','time-series'
-    modes = ('climatology',) 
+    NP = 3; ldebug = False # for quick computations
+#     modes = ('time-series','climatology')
+    modes = ('climatology',)
+#     modes = ('time-series',) 
     loverwrite = True
     varlist = None # ['T2']
     periods = []
@@ -207,46 +210,81 @@ if __name__ == '__main__':
 #    periods += [5]
 #    periods += [10]
     periods += [15]
-    periods += [30]
+#     periods += [30]
+    grid = None # just a default value - native grid
     # Observations/Reanalysis
     lLTM = True 
-    datasets = []; resolutions = None
-    resolutions = {'CRU':'','GPCC':'05','NARR':'','CFSR':'05'}
+    datasets = []; resolutions = None; unity_grid = None
+    resolutions = {'CRU':'','GPCC':['025','05','10','25'],'NARR':'','CFSR':['031','05'], 'NRCan':'NA12'}
+    datasets = []
+    datasets += ['NRCan']; periods = [(1970,2000),(1980,2010)]; lLTM = False
 #     datasets += ['PRISM']; periods = None; lLTM = True
 #     datasets += ['PCIC','PRISM']; periods = None; lLTM = True
-#     datasets += ['CFSR']; resolutions = {'CFSR':'031'}
-    datasets += ['Unity']
+#     datasets += ['CFSR']; resolutions = {'CFSR':['031','05']}
+#     datasets += ['Unity']; periods = [15,30] 
     # CESM experiments (short or long name) 
     CESM_project = None # use all experiments in project module
     load3D = False
     CESM_experiments = [] # use None to process all CESM experiments
 #     CESM_experiments += ['Ctrl-1']
-#     CESM_filetypes = ['atm'] # ,'lnd'
-    CESM_filetypes = ['lnd']
+    CESM_filetypes = ['atm'] # ,'lnd'
+#     CESM_filetypes = ['lnd']
     # WRF experiments (short or long name)
-    WRF_project = 'GreatLakes' # only use GreatLakes experiments
+#     WRF_project = None
+    WRF_project = 'GreatLakes'; unity_grid = 'glb1_d02' # only GreatLakes experiments
+#     WRF_project = 'WesternCanada'; unity_grid = 'arb2_d02' # only WesternCanada experiments
+#     WRF_experiments = None
     WRF_experiments = []
-#     WRF_experiments += ['erai-t', 'erai-g']
+#     WRF_experiments += ['erai-t', 'erai-g','erai-t3', 'erai-g3']
+#     WRF_experiments += ['g3-ensemble','g3-ensemble-2050','g3-ensemble-2100']
+#     WRF_experiments += ['t3-ensemble','t3-ensemble-2050','t3-ensemble-2100']
+#     WRF_experiments += ['g-ensemble','g-ensemble-2050','g-ensemble-2100']
+#     WRF_experiments += ['t-ensemble','t-ensemble-2050','t-ensemble-2100']
+# #     WRF_experiments += ['g-ensemble','t-ensemble']
+#     WRF_experiments += ['g3-ctrl',     'g3-ens-A',     'g3-ens-B',     'g3-ens-C',]
+#     WRF_experiments += ['g3-ctrl-2050','g3-ens-A-2050','g3-ens-B-2050','g3-ens-C-2050',]
+#     WRF_experiments += ['g3-ctrl-2100','g3-ens-A-2100','g3-ens-B-2100','g3-ens-C-2100',]
+#     WRF_experiments += ['t3-ctrl',     't3-ens-A',     't3-ens-B',     't3-ens-C',]
+#     WRF_experiments += ['t3-ctrl-2050','t3-ens-A-2050','t3-ens-B-2050','t3-ens-C-2050',]
+#     WRF_experiments += ['t3-ctrl-2100','t3-ens-A-2100','t3-ens-B-2100','t3-ens-C-2100',]
+#     WRF_experiments += ['g-ctrl',     'g-ens-A',     'g-ens-B',     'g-ens-C',]
+#     WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
+#     WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
+#     WRF_experiments += ['t-ctrl',     't-ens-A',     't-ens-B',     't-ens-C',]
+#     WRF_experiments += ['t-ctrl-2050','t-ens-A-2050','t-ens-B-2050','t-ens-C-2050',]
+#     WRF_experiments += ['t-ctrl-2100','t-ens-A-2100','t-ens-B-2100','t-ens-C-2100',]
 #     WRF_experiments += ['g-ctrl', 'g-ctrl-2050', 'g-ctrl-2100']
-#     WRF_experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',][1:]
+#     WRF_experiments += ['g-ctrl','g-ens-A','g-ens-B','g-ens-C',]
+#     WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
+#     WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
+#     WRF_experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',]
+#     WRF_experiments += ['max-ctrl-2050','max-ens-A-2050','max-ens-B-2050','max-ens-C-2050',]
+#     WRF_experiments += ['max-ctrl-2100','max-ens-A-2100','max-ens-B-2100','max-ens-C-2100',]
 #     WRF_experiments += ['max-ens','max-ens-2050','max-ens-2100'] # requires different implementation...
     # other WRF parameters 
-#     domains = None # domains to be processed
-    domains = (2,) # domains to be processed
-    WRF_filetypes = ('srfc',)
-#     WRF_filetypes = ('srfc','xtrm','plev3d','hydro','lsm') # filetypes to be processed # ,'rad'
+    domains = None # domains to be processed
+#     domains = (2,) # domains to be processed
+#     WRF_filetypes = ('lsm','xtrm','rad','srfc') # 'hydro',
+    WRF_filetypes = ('srfc','xtrm','plev3d','hydro','lsm','rad','aux') # filetypes to be processed
 #     WRF_filetypes = ('xtrm','lsm') # filetypes to be processed    
 #     WRF_filetypes = ('const',); periods = None
+#     WRF_filetypes = ('aux','aabc',)
+#     WRF_filetypes = ('aux',)
+    grid = None # grid parameter to load datasets
     # define shape data  
-    shape_name = 'shpavg' # Canadian shapes
-    shapes = dict()
-    shapes['basins'] = None # river basins (in Canada) from WSC module
-    shapes['provinces'] = None # Canadian provinces from EC module
-#     shapes['provinces'] = ['BC'] # Canadian provinces from EC module
-#     shape_name = 'basins' # only Canadian river basins
-#     shapes = dict()
-#     shapes['basins'] = ['GLB','GRW'] # river basins (in Canada) from WSC module
-#     shapes['provinces'] = ['ON'] # Canadian provinces from EC module
+    shapes = OrderedDict()
+#     shape_name = 'shpavg' # all Canadian shapes
+#     shapes['provinces'] = None # Canadian provinces from EC module
+#     shapes['basins'] = None # river basins (in Canada) from WSC module
+#     shape_name = 'wcshp' # Western Canadian shapes
+#     shapes['provinces'] = ['BC','AB'] # Canadian provinces from EC module
+#     shapes['basins'] = ['PSB','NorthernPSB','SouthernPSB','FRB','UpperFRB','LowerFRB','CRB',
+#                         'ARB','UpperARB','LowerARB','SSR','NRB',] # river basins (in Canada) from WSC module
+    shape_name = 'glbshp' # only Canadian river basins
+    shapes['provinces'] = ['MB','ON','QC'] # Canadian provinces from EC module
+    shapes['basins'] = ['LandGLB','GLB','GRW','UpperGRW','LowerGRW','NorthernGRW','SouthernGRW','WesternGRW','SNW','PRW'] # river basins (in Canada) from WSC module
+#     shape_name = 'glakes' # Great Lakes
+#     shapes['great_lakes'] = None # the Great Lakes of North America
      
  
   ## process arguments    
@@ -257,24 +295,31 @@ if __name__ == '__main__':
   # check and expand CESM experiment list
   CESM_experiments = getExperimentList(CESM_experiments, CESM_project, 'CESM')
   # expand datasets and resolutions
-  if datasets is None: datasets = gridded_datasets  
+  if datasets is None: datasets = gridded_datasets
+  if unity_grid is None and 'Unity' in datasets:
+    if WRF_project: unity_grid = import_module('projects.{:s}'.format(WRF_project)).unity_grid
+    else: raise DatasetError("Dataset 'Unity' has no native grid - please set 'unity_grid'.") 
+  
 
-  # expand shapes (and enforce consistent sorting)
-  if 'provinces' in shapes and shapes['provinces'] is None:
-    items = provinces.keys()
-    if not isinstance(provinces, OrderedDict): items.sort()     
-    shapes['provinces'] = items
-  if 'basins' in shapes and shapes['basins'] is None:
-    items = basins.keys()
-    if not isinstance(basins, OrderedDict): items.sort()
-    shapes['basins'] = items
-      
-  # add shapes of different categories
+  # import shapes from project
+  proj_dict = getProjectVars(shapes.keys(), project=WRF_project, module=None)
+  # assemble shape dictionary
   shape_dict = OrderedDict()
-  if 'provinces' in shapes:
-    for shp in shapes['provinces']: shape_dict[shp] = provinces[shp]
-  if 'basins' in shapes:
-    for shp in shapes['basins']: shape_dict[shp] = basins[shp]
+  shapenames = shapes.keys(); 
+  shapenames.sort(); shapenames.reverse() # for backwards compatibility
+  for shapename in shapenames:
+    proj_shapes = proj_dict[shapename]
+    if not isinstance(proj_shapes, dict): raise TypeError(proj_shapes)
+    shapelist = shapes[shapename]
+    if shapelist is None: 
+      shapelist = proj_shapes.keys()
+      if not isinstance(proj_shapes, OrderedDict): shapelist.sort() # sort names in-place
+      shapes[shapename] = shapelist # update shapes for report
+    try:
+      for key in shapelist: shape_dict[key] = proj_shapes[key]
+    except KeyError: 
+      raise KeyError("Name '{:s}' not found in shape dictionary '{:s}'.".format(key,shapename))
+
     
   # print an announcement
   if len(WRF_experiments) > 0:
@@ -297,7 +342,7 @@ if __name__ == '__main__':
   # loop over modes
   for mode in modes:
     # only climatology mode has periods    
-    if mode == 'climatology': periodlist = periods
+    if mode == 'climatology': periodlist = [] if periods is None else periods
     elif mode == 'time-series': periodlist = (None,)
     else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)
 
@@ -314,19 +359,22 @@ if __name__ == '__main__':
           if resolutions is None: dsreses = mod.LTM_grids
           elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.LTM_grids]  
           for dsres in dsreses: 
-            args.append( (dataset, mode, shape_name, shape_dict, dict(varlist=varlist, period=None, resolution=dsres)) ) # append to list
+            args.append( (dataset, mode, shape_name, shape_dict, dict(varlist=varlist, period=None, resolution=dsres, 
+                                                                      grid=grid, unity_grid=unity_grid)) ) # append to list
         # climatologies derived from time-series
         if resolutions is None: dsreses = mod.TS_grids
         elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
         for dsres in dsreses:
           for period in periodlist:
-            args.append( (dataset, mode, shape_name, shape_dict, dict(varlist=varlist, period=period, resolution=dsres)) ) # append to list            
+            args.append( (dataset, mode, shape_name, shape_dict, dict(varlist=varlist, period=period, resolution=dsres, 
+                                                                      grid=grid, unity_grid=unity_grid)) ) # append to list            
       elif mode == 'time-series': 
         # regrid the entire time-series
         if resolutions is None: dsreses = mod.TS_grids
         elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
         for dsres in dsreses:
-          args.append( (dataset, mode, shape_name, shape_dict, dict(varlist=varlist, period=None, resolution=dsres)) ) # append to list            
+          args.append( (dataset, mode, shape_name, shape_dict, dict(varlist=varlist, period=None, resolution=dsres, 
+                                                                    grid=grid, unity_grid=unity_grid)) ) # append to list            
     
     # CESM datasets
     for experiment in CESM_experiments:
@@ -334,7 +382,7 @@ if __name__ == '__main__':
         for period in periodlist:
           # arguments for worker function: dataset and dataargs       
           args.append( ('CESM', mode, shape_name, shape_dict, dict(experiment=experiment, varlist=varlist, filetypes=[filetype], 
-                                                                   period=period, load3D=load3D)) )
+                                                                   grid=grid, period=period, load3D=load3D)) )
     # WRF datasets
     for experiment in WRF_experiments:
       for filetype in WRF_filetypes:
@@ -346,7 +394,7 @@ if __name__ == '__main__':
           for period in periodlist:
             # arguments for worker function: dataset and dataargs       
             args.append( ('WRF', mode, shape_name, shape_dict, dict(experiment=experiment, varlist=varlist, filetypes=[filetype], 
-                                                                    domain=domain, period=period)) )
+                                                                    grid=grid, domain=domain, period=period)) )
       
   # static keyword arguments
   kwargs = dict(loverwrite=loverwrite, varlist=varlist)

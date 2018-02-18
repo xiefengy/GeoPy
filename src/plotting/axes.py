@@ -11,13 +11,16 @@ import numpy as np
 import matplotlib as mpl
 from matplotlib.axes import Axes
 from mpl_toolkits.axes_grid.axes_divider import LocatableAxes
+from matplotlib.projections import PolarAxes
 from types import NoneType
+from warnings import warn
 # internal imports
-from geodata.base import Variable
+from geodata.base import Variable, Ensemble
 from geodata.misc import ListError, ArgumentError, isEqual, AxisError
 from plotting.misc import smooth, checkVarlist, getPlotValues, errorPercentile, checkSample
 from collections import OrderedDict
-from utils.misc import binedges, expandArgumentList
+from utils.misc import binedges, expandArgumentList, containerDepth
+from geodata.stats import pearsonr
 
 # list of plot arguments that apply only to lines
 line_args = ('lineformats','linestyles','markers','lineformat','linestyle','marker')
@@ -43,11 +46,12 @@ class MyAxes(Axes):
   xtop               = False
   yname              = None
   yunits             = None
-  ypad               = 0
+  ypad               = 2
   yright             = False
   figure             = None
   parasite_axes      = None
   axes_shift         = None
+  ldatetime          = None
   
   def __init__(self, *args, **kwargs):
     ''' constructor to initialize some variables / counters '''  
@@ -59,26 +63,141 @@ class MyAxes(Axes):
     self.updateAxes(mode='shift') # initialize
     
     
+  def scatterPlot(self, xvars=None, yvars=None, datasets=None,  xname=None, yname=None, label_ext='',
+                  legend=None, llabel=True, labels=None, hline=None, vline=None, title=None, lignore=False,        
+                  flipxy=None, xlabel=True, ylabel=True, xticks=True, yticks=True, reset_color=False, 
+                  lparasiteAxes=False, lrescale=False, scalefactor=1., offset=0., 
+                  lprint=False, lfracdiff=False, xlog=False, ylog=False, xlim=None, ylim=None, 
+                  expand_list=None, lproduct='inner', plotatts=None, **plotargs):
+    ''' A function to draw a list of 1D variables into an axes, and annotate the plot based on 
+        variable properties; extra keyword arguments (plotargs) are passed through expandArgumentList,
+        before being passed to Axes.plot(). '''
+    ## figure out variables
+    xvars = checkVarlist(xvars or datasets, varname=xname, ndim=1, lignore=lignore)
+    yvars = checkVarlist(yvars or datasets, varname=yname, ndim=1, lignore=lignore)
+    assert len(xvars) == len(yvars)
+    # initialize axes names and units
+    self.flipxy = flipxy
+    if self.flipxy: yname,yunits,xname,xunits = self.xname,self.xunits,self.yname,self.yunits
+    else: xname,xunits,yname,yunits = self.xname,self.xunits,self.yname,self.yunits
+    ## figure out plot arguments
+    # reset color cycle
+    if reset_color is False: pass
+    elif reset_color is True: self.set_prop_cycle(None) # reset
+    else: self.set_prop_cycle(reset_color)
+    # figure out label list
+    if labels is None: 
+        xlabels = self._getPlotLabels(xvars)
+        ylabels = self._getPlotLabels(yvars)
+        labels = []
+        for xlabel,ylabel in zip(xlabels,ylabels):
+            if xlabel == ylabel: labels.append(xlabel) # typically be the case for datasets
+            else: labels.append('{}_{}'.format(xlabel,ylabel))
+    elif len(labels) < len(xvars): raise ArgumentError("Incompatible length of varlist and labels.")
+    elif len(labels) > len(xvars): labels = labels[:len(xvars)] # truncate 
+    label_list = labels if llabel else [None]*len(labels) # used for plot labels later
+    assert len(labels) == len(xvars) == len(yvars)
+    # finally, expand keyword arguments
+    plotargs = self._expandArgumentList(labels=label_list, expand_list=expand_list, 
+                                        lproduct=lproduct, plotargs=plotargs)
+    assert len(plotargs) == len(xvars)
+    # initialize parasitic axes for univariate scatter
+    if lparasiteAxes: raise NotImplementedError
+    ## generate individual scatter plots
+    plts = [] # list of plot handles
+    for label,xvar,yvar in zip(labels,xvars,yvars): 
+        self.variables[label] = (xvar,yvar) # save plot variables
+    # loop over variables and plot arguments
+    if lprint and lfracdiff: 
+        raise NotImplementedError("See frac/diff implementation in linePlot for an example...") # tmp_frac = None; tmp_diff = None
+    N = len(xvars); xlen = ylen = None
+    for n,xvar,yvar,plotarg,label in zip(xrange(N),xvars,yvars,plotargs,labels):
+      if xvar is not None and yvar is not None:
+        # check common axis
+        assert xvar.shape == yvar.shape, ( xvar.shape, yvar.shape )
+        assert xvar.axes[0].units == yvar.axes[0].units
+        # scale axis and variable values 
+        xval, xunits, xname = self._getPlotValues(xvar, checkunits=xunits, lrescale=lrescale, scalefactor=scalefactor, offset=offset)
+        yval, yunits, yname = self._getPlotValues(yvar, checkunits=yunits, lrescale=lrescale, scalefactor=scalefactor, offset=offset)
+        # N.B.: other scaling behavior could be added here
+        if lprint:
+          xymean = (np.nanmean(xval),np.nanmean(yval))
+          xystd = (np.nanstd(xval),np.nanstd(yval))
+          print n, label, xymean, xystd
+          if lfracdiff: raise NotImplementedError("See frac/diff implementation in linePlot for an example...") 
+        # update plotargs from defaults
+        plotarg = self._getPlotArgs(label=label, var=xvar, llabel=llabel, label_ext=label_ext, plotatts=plotatts, plotarg=plotarg)
+        s = plotarg.pop('markersize')**2 if 'markersize' in plotarg else 25 # equivalent to markersize=5 
+        c = plotarg.pop('markercolor',plotarg.pop('color',None)) # markercolor supersedes color, but both work
+        # figure out orientation and call plot function
+        if self.flipxy: # flipped axes
+          xlen = len(yval); ylen = len(xval) # used later
+          plt = self.scatter(yval, xval, s, c, **plotarg)
+        else: # default orientation
+          xlen = len(xval); ylen = len(yval) # used later
+          plt = self.scatter(xval, yval, s, c, **plotarg)
+        plts.append(plt); self.plots[label+label_ext] = plt
+      else: plts.append(None)
+    ## format axes and add annotation
+    # set axes labels  
+    if not lrescale: # don't reset name/units when variables were rescaled to existing axes
+      if self.flipxy: self.xname,self.xunits,self.yname,self.yunits = yname,yunits,xname,xunits
+      else: self.xname,self.xunits,self.yname,self.yunits = xname,xunits,yname,yunits
+    # apply standard formatting and annotation
+    self.formatAxesAndAnnotation(title=title, legend=legend, xlabel=xlabel, ylabel=ylabel, 
+                                 hline=hline, vline=vline, xlim=xlim, xlog=xlog, xticks=xticks, 
+                                 ylim=ylim, ylog=ylog, yticks=yticks, xlen=xlen, ylen=ylen)
+    # return handles to line objects
+    return (plts,) # in tuple, for consistency with linePlot
+    
   def linePlot(self, varlist, varname=None, bins=None, support=None, errorbar=None, errorband=None,  
-               legend=None, llabel=True, labels=None, hline=None, vline=None, title=None, lignore=False,        
-               flipxy=None, xlabel=True, ylabel=True, xticks=True, yticks=True, reset_color=None, 
+               legend=None, llabel=True, labels=None, label_ext='', hline=None, vline=None, title=None,        
+               flipxy=None, xlabel=True, ylabel=True, xticks=True, yticks=True, reset_color=False, 
                lparasiteMeans=False, lparasiteErrors=False, parasite_axes=None, lrescale=False, 
                scalefactor=1., offset=0., bootstrap_axis='bootstrap', lprint=False, lfracdiff=False,
-               xlog=False, ylog=False, xlim=None, ylim=None, lsmooth=False, lperi=False,
+               xlog=False, ylog=False, xlim=None, ylim=None, lsmooth=False, lperi=False, lignore=False,
                expand_list=None, lproduct='inner', method='pdf', plotatts=None, **plotargs):
     ''' A function to draw a list of 1D variables into an axes, and annotate the plot based on 
         variable properties; extra keyword arguments (plotargs) are passed through expandArgumentList,
         before being passed to Axes.plot(). '''
     ## figure out variables
+    container = (list,tuple,Ensemble)
+    vardepth = containerDepth(varlist, classes=container) # count nested containers
     varlist = checkVarlist(varlist, varname=varname, ndim=1, bins=bins, support=support, 
                            method=method, lignore=lignore, bootstrap_axis=bootstrap_axis)
-    if errorbar: errlist = checkVarlist(errorbar, varname=varname, ndim=1, lignore=lignore, 
-                                        bins=bins, support=support, method=method, bootstrap_axis=bootstrap_axis)
-    else: errlist = [None]*len(varlist) # no error bars
-    if errorband: bndlist = checkVarlist(errorband, varname=varname, ndim=1, lignore=lignore, 
-                                         bins=bins, support=support, method=method, bootstrap_axis=bootstrap_axis)
-    else: bndlist = [None]*len(varlist) # no error bands
-    assert len(varlist) == len(errlist) == len(bndlist)
+    if errorbar:
+      errordepth = containerDepth(errorbar, classes=container) 
+      if errordepth == vardepth+1:
+          assert len(errorbar)==2, errorbar 
+          errdnlst = checkVarlist(errorbar[0], varname=varname, ndim=1, lignore=lignore, bins=bins, 
+                               bootstrap_axis=bootstrap_axis)
+          erruplst = checkVarlist(errorbar[1], varname=varname, ndim=1, lignore=lignore, bins=bins, 
+                               bootstrap_axis=bootstrap_axis)
+          assert len(errdnlst) == len(erruplst), (len(errdnlst),len(erruplst))
+      elif errordepth == vardepth:
+          erruplst = checkVarlist(errorbar, varname=varname, ndim=1, lignore=lignore, bins=bins, 
+                               bootstrap_axis=bootstrap_axis)
+          errdnlst = [None]*len(varlist) # no min/max error, only one margin
+      else:
+          raise ArgumentError(errordepth)
+    else: erruplst = errdnlst = [None]*len(varlist) # no error bars
+    if errorband:
+      banddepth = containerDepth(errorband, classes=container) 
+      if banddepth == vardepth+1:
+          assert len(errorband)==2, errorband
+          bnddnlst = checkVarlist(errorband[0], varname=varname, ndim=1, lignore=lignore, bins=bins, 
+                               support=support, method=method, bootstrap_axis=bootstrap_axis)
+          bnduplst = checkVarlist(errorband[1], varname=varname, ndim=1, lignore=lignore, bins=bins, 
+                               support=support, method=method, bootstrap_axis=bootstrap_axis)
+          assert len(bnddnlst) == len(bnduplst), (len(bnddnlst),len(bnduplst))
+      elif banddepth == vardepth:
+          bnduplst = checkVarlist(errorband, varname=varname, ndim=1, lignore=lignore, bins=bins, 
+                               support=support, method=method, bootstrap_axis=bootstrap_axis)
+          bnddnlst = [None]*len(varlist) # no min/max error, only one margin
+      else: 
+          raise ArgumentError(banddepth)
+    else: bnduplst = bnddnlst = [None]*len(varlist) # no error bands
+    assert len(varlist) == len(erruplst) == len(bnduplst)== len(errdnlst) == len(bnddnlst)
     # initialize axes names and units
     self.flipxy = flipxy
     if self.flipxy: varname,varunits,axname,axunits = self.xname,self.xunits,self.yname,self.yunits
@@ -90,7 +209,7 @@ class MyAxes(Axes):
     else: self.set_prop_cycle(reset_color)
     # figure out label list
     if labels is None: labels = self._getPlotLabels(varlist)           
-    elif len(labels) < len(varlist): raise ArgumentError, "Incompatible length of varlist and labels."
+    elif len(labels) < len(varlist): raise ArgumentError("Incompatible length of varlist and labels.")
     elif len(labels) > len(varlist): labels = labels[:len(varlist)] # truncate 
     label_list = labels if llabel else [None]*len(labels) # used for plot labels later
     assert len(labels) == len(varlist)
@@ -105,24 +224,37 @@ class MyAxes(Axes):
     ## generate individual line plots
     plts = [] # list of plot handles
     for label,var in zip(labels,varlist): self.variables[label] = var # save plot variables
-    # loop over variables and plot arguments
-    if lprint and lfracdiff: tmp_frac = None; tmp_diff = None
+    # print legend for print statistics
+    if lprint:
+        if lfracdiff:
+            tmp_frac = None; tmp_diff = None
+            print('Label (Variable): Average, Standard Deviation, Relative Bias, Absolute Bias')  
+        else: print('Label (Variable): Average, Standard Deviation')
     N = len(varlist); xlen = ylen = None
-    for n,var,errvar,bndvar,plotarg,label in zip(xrange(N),varlist,errlist,bndlist,plotargs,labels):
+    # loop over variables and plot arguments
+    for n,var,errupvar,errdnvar,bndupvar,bnddnvar,plotarg,label in zip(xrange(N),varlist,erruplst,errdnlst,bnduplst,bnddnlst,plotargs,labels):
       if var is not None:
         varax = var.axes[0]
         # scale axis and variable values 
-        axe, axunits, axname = self._getPlotValues(varax, checkunits=axunits, laxis=True, lperi=lperi)
+        axe, axunits, axname = self._getPlotValues(varax, checkunits=axunits, laxis=True, lperi=lperi)        
         val, varunits, varname = self._getPlotValues(var, lrescale=lrescale, scalefactor=scalefactor, offset=offset,
                                                      checkunits=varunits, lsmooth=lsmooth, lperi=lperi, lshift=True)
-        if errvar is not None: # for error bars
-          err, varunits, errname = self._getPlotValues(errvar, lrescale=lrescale, scalefactor=scalefactor, offset=offset, 
+        if errupvar is not None: # for upper/symmetric error bars
+          errup, varunits, errname = self._getPlotValues(errupvar, lrescale=lrescale, scalefactor=scalefactor, offset=offset, 
                                                        checkunits=varunits, lsmooth=lsmooth, lperi=lperi, lshift=False); del errname
-        else: err = None
-        if bndvar is not None: # semi-transparent error bands
-          bnd, varunits, bndname = self._getPlotValues(bndvar, lrescale=lrescale, scalefactor=scalefactor, offset=offset,
+        else: errup = None
+        if errdnvar is not None: # for lower error bars
+          errdn, varunits, errname = self._getPlotValues(errdnvar, lrescale=lrescale, scalefactor=scalefactor, offset=offset, 
+                                                       checkunits=varunits, lsmooth=lsmooth, lperi=lperi, lshift=False); del errname
+        else: errdn = None
+        if bndupvar is not None: # for upper/symmetric semi-transparent error bands
+          bndup, varunits, bndname = self._getPlotValues(bndupvar, lrescale=lrescale, scalefactor=scalefactor, offset=offset,
                                                        checkunits=varunits, lsmooth=lsmooth, lperi=lperi, lshift=False); del bndname
-        else: bnd = None
+        else: bndup = None
+        if bnddnvar is not None: # for lower semi-transparent error bands
+          bnddn, varunits, bndname = self._getPlotValues(bnddnvar, lrescale=lrescale, scalefactor=scalefactor, offset=offset,
+                                                       checkunits=varunits, lsmooth=lsmooth, lperi=lperi, lshift=False); del bndname
+        else: bnddn = None
         # variable and axis scaling is not always independent...
         if var.plot is not None and varax.plot is not None: 
           if varax.units != axunits and var.plot.preserve == 'area':
@@ -131,14 +263,14 @@ class MyAxes(Axes):
         if lprint:
           tmp_mean = np.nanmean(val)
           if not lfracdiff:
-            print var.name, tmp_mean, np.nanstd(val)
+            print('{} ({}): {}, {}'.format(label, var.name, tmp_mean, np.nanstd(val)))
           elif tmp_frac is None and tmp_diff is None: 
             tmp_frac = tmp_mean; tmp_diff = tmp_mean
-            print var.name, tmp_mean, np.nanstd(val)
+            print('{} ({}): {}, {}'.format(label, var.name, tmp_mean, np.nanstd(val)))
           else:
-            print var.name, tmp_mean, np.nanstd(val), tmp_mean/tmp_frac, tmp_mean-tmp_diff  
+            print('{} ({}): {}, {}, {}, {}'.format(label, var.name, tmp_mean, np.nanstd(val), tmp_mean/tmp_frac, tmp_mean-tmp_diff))  
         # update plotargs from defaults
-        plotarg = self._getPlotArgs(label=label, var=var, llabel=llabel, plotatts=plotatts, plotarg=plotarg)
+        plotarg = self._getPlotArgs(label=label, var=var, llabel=llabel, label_ext=label_ext, plotatts=plotatts, plotarg=plotarg)
         plotarg['fmt'] = plotarg.pop('lineformat','') # rename (I prefer a different name)
         # N.B.: '' (empty string) is the default, None means no line is plotted, only errors!
         # extract arguments for error band
@@ -149,11 +281,30 @@ class MyAxes(Axes):
         facecolor = plotarg.pop('facecolor',None)
         errorscale = plotarg.pop('errorscale',None)
         errorevery = plotarg.pop('errorevery',None)
-        if errorscale is not None: 
-          errorscale = errorPercentile(errorscale)
-          if err is not None: err *= errorscale
+        if 'color' not in plotarg: 
+          plotarg['color'] = self._get_lines.prop_cycler.next()['color']
+        # figure out boundaries for error bands (may be needed for parasite axes)
+        if bndup is not None: 
+          if bnddn is None:
+              if errorscale is not None: bndup *= errorscale
+              bnddn = val - bndup
+              bndup += val
+          else:
+              if errorscale is not None: raise NotImplementedError
+        # figure out errorbars
         if errorevery is None:
           errorevery = len(axe)//25 + 1
+        if errorscale is not None: 
+          errorscale = errorPercentile(errorscale)
+        if errup is not None: 
+          if errdn is None: 
+              err = np.stack((errup,errup)) # same errors up and down
+              if errorscale is not None: err *= errorscale
+          else: 
+              err = np.stack((errdn,errup)) - val.reshape((1,val.size))
+              # N.B.: interpreted as upper and lower bounds (as in percentiles), not deviations
+              if errorscale is not None: raise NotImplementedError
+        else: err = None
         # figure out orientation and call plot function
         if self.flipxy: # flipped axes
           xlen = len(val); ylen = len(axe) # used later
@@ -162,15 +313,18 @@ class MyAxes(Axes):
         else: # default orientation
           xlen = len(axe); ylen = len(val) # used later
           plt = self.errorbar(axe, val, xerr=None, yerr=err, errorevery=errorevery, **plotarg)[0]
-          if lparasiteMeans:
-            perr = err if err is not None else bnd # wouldn't work with bands, so use normal errorbars
+          if lparasiteMeans:            
+            if err is not None: perr = err # use same errors 
+            elif bndup is not None: perr = np.stack((bnddn,bndup)) - val.reshape((1,val.size))
+            else: perr = None 
+            # N.B.: parasite erros wouldn't work with bands, so convert normal errorbars                
             self.addParasiteMean(val, errors=perr if lparasiteErrors else None, n=n, N=N, lperi=lperi, style='myerrorbar', **plotarg)
-        # figure out parameters for error bands
-        if bnd is not None: 
-          if errorscale is not None: bnd *= errorscale
-          self._drawBand(axe, val+bnd, val-bnd, where=where, color=(facecolor or plt.get_color()), 
-                         alpha=bandalpha*plotarg.get('alpha',1.), edgecolor=edgecolor, **bndarg)  
-        plts.append(plt); self.plots[label] = plt
+        # draw error bands
+        if bndup is not None: 
+          self._drawBand(axe, bndup, bnddn, where=where, color=(facecolor or plt.get_color()), 
+                         alpha=bandalpha*plotarg.get('alpha',1.), edgecolor=edgecolor, **bndarg)
+        # save plot handles and labels  
+        plts.append(plt); self.plots[label+label_ext] = plt
       else: plts.append(None)
     ## format axes and add annotation
     # set axes labels  
@@ -190,7 +344,7 @@ class MyAxes(Axes):
   def bandPlot(self, upper=None, lower=None, varname=None, bins=None, support=None, lignore=False,   
                legend=None, llabel=False, labels=None, hline=None, vline=None, title=None,   
                lrescale=False, scalefactor=1., offset=0., bootstrap_axis='bootstrap', band_vars=None,  
-               flipxy=None, xlabel=True, ylabel=True, xticks=True, yticks=True, reset_color=None, 
+               flipxy=None, xlabel=True, ylabel=True, xticks=True, yticks=True, reset_color=False, 
                xlog=None, ylog=None, xlim=None, ylim=None, lsmooth=False, lperi=False, lprint=False, 
                expand_list=None, lproduct='inner', method='pdf', plotatts=None, **plotargs):
     ''' A function to draw a colored bands between two lists of 1D variables representing the upper
@@ -295,7 +449,7 @@ class MyAxes(Axes):
                  sample_axis=None, lmedian=None, median_fmt='', lmean=True, mean_fmt='', band_vars=None, 
                  bootstrap_axis=None, lrescale=False, scalefactor=1., offset=0., colors=None, color = None,
                  legend=None, llabel=True, labels=None, hline=None, vline=None, title=None,        
-                 flipxy=None, xlabel=True, ylabel=False, xticks=True, yticks=True, reset_color=None, 
+                 flipxy=None, xlabel=True, ylabel=False, xticks=True, yticks=True, reset_color=False, 
                  xlog=False, ylog=False, xlim=None, ylim=None, lsmooth=False, lprint=False,
                  lignore=False, expand_list=None, lproduct='inner', plotatts=None, method='pdf',
                  where=None, bandalpha=None, edgecolor=None, facecolor=None, bandarg=None, **plotargs):
@@ -389,7 +543,7 @@ class MyAxes(Axes):
                bootstrap_axis='bootstrap', lmedian=None, median_fmt='', lmean=False, mean_fmt='', 
                lvar=False, lvarBand=False, band_vars=None, lrescale=False, scalefactor=1., offset=0.,
                legend=None, llabel=True, labels=None, hline=None, vline=None, title=None,        
-               flipxy=None, xlabel=True, ylabel=False, xticks=True, yticks=False, reset_color=None, 
+               flipxy=None, xlabel=True, ylabel=False, xticks=True, yticks=False, reset_color=False, 
                xlog=False, ylog=False, xlim=None, ylim=None, lsmooth=False, lprint=False,
                lignore=False, expand_list=None, lproduct='inner', plotatts=None,
                where=None, bandalpha=None, edgecolor=None, facecolor=None, bandarg=None,  
@@ -449,7 +603,7 @@ class MyAxes(Axes):
                 lnormalize=True, lcumulative=0, legend=None, llabel=True, labels=None, lflatten=True,
                 colors=None, color=None, align='mid', rwidth=None, bottom=None, weights=None, 
                 xlabel=True, ylabel=True, lignore=False,  
-                xticks=True, yticks=True, hline=None, vline=None, title=None, reset_color=True, 
+                xticks=True, yticks=True, hline=None, vline=None, title=None, reset_color=False, 
                 flipxy=None, log=False, xlim=None, ylim=None, lprint=False, plotatts=None, **histargs):
     ''' A function to draw histograms of a list of 1D variables into an axes, 
         and annotate the plot based on variable properties. '''
@@ -493,6 +647,7 @@ class MyAxes(Axes):
         # scale variable values(axes are irrelevant)
         val, varunits, varname = getPlotValues(var, checkunits=varunits, checkname=None)
         val = val.ravel() # flatten array
+        val = val[~np.isnan(val)] # remove NaN's
         if not varname.endswith('_bins'): varname += '_bins'
         if lprint: print varname, varunits, np.nanmean(val), np.nanstd(val)
         # get default plotargs consistent with linePlot (but only color will be used)  
@@ -546,7 +701,7 @@ class MyAxes(Axes):
     if not isinstance(hline,(list,tuple,np.ndarray)): hline = (hline,)
     lines = []
     for hl in list(hline):
-      if isinstance(hl,(int,np.integer,float,np.inexact)): 
+      if isinstance(hl,(int,np.integer,float,np.inexact,np.datetime64)): 
         lines.append(self.axhline(y=hl, **kwargs))
         if self.parasite_axes: 
           self.parasite_axes.axhline(y=hl, **kwargs)
@@ -559,7 +714,7 @@ class MyAxes(Axes):
     if not isinstance(vline,(list,tuple,np.ndarray)): vline = (vline,)
     lines = []
     for hl in list(vline):
-      if isinstance(hl,(int,np.integer,float,np.inexact)): 
+      if isinstance(hl,(int,np.integer,float,np.inexact,np.datetime64)): 
         lines.append(self.axvline(x=hl, **kwargs))
       else: raise TypeError, hl.__class__
     return lines    
@@ -638,18 +793,19 @@ class MyAxes(Axes):
     # average values (three points, to avoid cut-off)
     if lperi: 
       vals = values[1:-1].copy() # cut off boundaries
-      if errors is not None: errs = errors[1:-1].copy() # cut off boundaries
+      if errors is not None: errs = errors[:,1:-1].copy() # cut off boundaries
     else:
       vals = values.copy()
       if errors is not None: errs = errors.copy()
     # average means
-    val = vals.mean().repeat(3)
+    val = np.nanmean(vals).repeat(3) # there can be missing values - just omit them...
     # average variances (not std directly)
     if errors is not None:
-      if lperi: err = ((errs**2).mean(keepdims=True)**0.5)
-      else: err = (((errs**2).mean(keepdims=True) + vals.var(keepdims=True))**0.5)
-      err = err.repeat(3)
+      if lperi: err = ((errs**2).mean(axis=1, keepdims=True)**0.5)
+      else: err = (((errs**2).mean(axis=1, keepdims=True) + vals.var(axis=1, keepdims=True))**0.5)
+      # N.B.: we use upper and lower errors, so errs has the shape (2,N)
       # N.B.: std = sqrt( mean of variances + variance of means )
+      err = err.repeat(3, axis=1)
     else: err = None
     # remove some style parameters that don't apply
     kwargs.pop('errorevery', None)
@@ -705,6 +861,8 @@ class MyAxes(Axes):
     if lrescale: checkunits = None
     val, varunits, varname = getPlotValues(var, checkunits=checkunits, checkname=None, lsmooth=lsmooth, 
                                            lperi=lperi, laxis=laxis)
+    if laxis:
+        self.ldatetime = np.issubdtype(val.dtype,np.datetime64)
     if lrescale:
       if self.flipxy: vlim,varunits = self.get_xlim(),self.xunits
       else: vlim,varunits = self.get_ylim(),self.yunits
@@ -731,7 +889,7 @@ class MyAxes(Axes):
       labels = range(len(varlist))
     return labels
   
-  def _getPlotArgs(self, label, var, llabel=False, plotatts=None, plotarg=None, plot_labels=None):
+  def _getPlotArgs(self, label, var, llabel=False, plotatts=None, plotarg=None, label_ext=None, plot_labels=None):
     ''' function to return plotting arguments/styles based on defaults and explicit arguments '''
     if not isinstance(label, (basestring,int,np.integer)): raise TypeError, label
     if not isinstance(var, Variable): raise TypeError
@@ -740,21 +898,26 @@ class MyAxes(Axes):
     args = dict()
     # apply figure/project defaults
     if label == var.name: # variable name has precedence
-      if var.dataset_name is not None and self.dataset_plotargs is not None: 
-        args.update(self.dataset_plotargs.get(var.dataset_name,{}))
-      if self.variable_plotargs is not None: args.update(self.variable_plotargs.get(var.name,{}))
-    else: # dataset name has precedence
-      if self.variable_plotargs is not None: args.update(self.variable_plotargs.get(var.name,{}))
-      if var.dataset_name is not None and self.dataset_plotargs is not None: 
-        args.update(self.dataset_plotargs.get(var.dataset_name,{}))
+      if self.dataset_plotargs: args.update(self.dataset_plotargs.get(var.dataset_name,{}))
+      if self.variable_plotargs: args.update(self.variable_plotargs.get(var.name,{}))
+    elif label == var.dataset_name: # dataset name has precedence
+      if self.variable_plotargs: args.update(self.variable_plotargs.get(var.name,{}))
+      if self.dataset_plotargs: args.update(self.dataset_plotargs.get(var.dataset_name,{}))
+    else: # label has precedence
+      if self.variable_plotargs: args.update(self.variable_plotargs.get(var.name,{}))
+      if self.dataset_plotargs: args.update(self.dataset_plotargs.get(var.dataset_name,{}))
+      if self.variable_plotargs: args.update(self.variable_plotargs.get(label,{}))
+      if self.dataset_plotargs: args.update(self.dataset_plotargs.get(label,{}))
     # apply axes/local defaults
-    if plotatts is not None: args.update(plotatts.get(label,{}))
     if plotarg is not None: args.update(plotarg)
+    if plotatts is not None: args.update(plotatts.get(label,{}))
     # relabel (simple name mapping)
     if plot_labels is None: plot_labels = self.plot_labels
     if plot_labels and label in plot_labels:
       if llabel: args['label'] = plot_labels[label] # only, if we actually want labels!
       label = plot_labels[label]
+    # add label extension for this plot
+    if label_ext: args['label'] = args['label'] + label_ext
     # return dictionary with keyword argument for plotting function
     return args
 
@@ -795,6 +958,15 @@ class MyAxes(Axes):
     # add orientation lines
     if hline is not None: self.addHline(hline)
     if vline is not None: self.addVline(vline)
+    # overwrite tick labels for datetime64 axis
+    if self.ldatetime:
+        axis = self.yaxis if self.flipxy else self.xaxis 
+        # format the ticks
+        major_locator = mpl.dates.AutoDateLocator()
+        axis.set_major_locator(major_locator)
+#         major_formater = mpl.dates.DateFormatter(major_locator)
+#         axis.set_major_formatter(major_formater)
+        # N.B.: for some reason this does not work and the formatter causes errors...
   
   def xLabel(self, xlabel, name=None, units=None):
     ''' format x-axis label '''
@@ -802,11 +974,11 @@ class MyAxes(Axes):
     units = self.xunits if units is None else units
     # figure out label 
     if isinstance(xlabel,basestring):
-      xlabel = xlabel.format(name,units)
+      xlabel = xlabel.format(NAME=name,UNITS=units)
     elif xlabel is not None and xlabel is not False:
       # only apply label, if ticks are also present
       xticks = self.xaxis.get_ticklabels()
-      # len(xticks) > 0 is necessary to avoid errors with AxesGrid, which removes invisible tick labels      
+      # len(xticks) > 0 is necessary to avoid errors with AxesGrid, which removes invisible tick labels
       if len(xticks) > 0 and xticks[-1].get_visible(): xlabel = self._axLabel(xlabel, name, units)
     if isinstance(xlabel,basestring):
       # N.B.: labelpad is ignored by AxesGrid
@@ -822,7 +994,7 @@ class MyAxes(Axes):
     units = self.yunits if units is None else units
     # figure out label 
     if isinstance(ylabel,basestring):
-      ylabel = ylabel.format(name,units)
+      ylabel = ylabel.format(NAME=name,UNITS=units)
     elif ylabel is not None and ylabel is not False:
       # only apply label, if ticks are also present
       yticks = ax.yaxis.get_ticklabels()
@@ -830,20 +1002,29 @@ class MyAxes(Axes):
     if isinstance(ylabel,basestring):
       # set Y-label
       ypad = self.ypad + 2 if self.yright else self.ypad # need a little more space on right hand side
+      # if there are only some negative values, reduce pad a bit
+      ymin,ymax = ax.get_ylim()
+      yvis = np.asarray([ytick.get_visible() for ytick in ax.yaxis.get_ticklabels()])
+      tmp = np.asarray(ax.yaxis.get_ticklocs()) # make sure this is an array!
+      ylocs = np.asarray([yt for yt in tmp[yvis] if ( yt <= ymax and yt >= ymin ) ])
+      yneg = np.sum(ylocs < 0)
+      if yneg > 0 and float(yneg)/ylocs.size < 0.35: ypad -= 5
       ax.set_ylabel(ylabel, labelpad=ypad) # labelpad is ignored by AxesGrid
       # label position
       ax.yaxis.set_label_position('right' if self.yright else 'left')
     return ylabel    
   def _axLabel(self, label, name, units):
     ''' helper method to format axes lables '''
-    if label is True: 
-      if not name and not units: label = ''
-      elif not units: label = '{0:s}'.format(name)
-      elif not name: label = '[{:s}]'.format(units)
-      else: label = '{0:s} [{1:s}]'.format(name,units)
+    if isinstance(self,PolarAxes):
+        label = None # PolarAxes don't have default labels
+    elif label is True: 
+        if not name and not units: label = ''
+        elif not units: label = '{:s}'.format(name)
+        elif not name: label = '[{:s}]'.format(units)
+        else: label = '{0:s} [{1:s}]'.format(name,units)
     elif label is False or label is None: label = ''
-    elif isinstance(label,basestring): label = label.format(name,units)
-    else: raise ValueError, label
+    elif isinstance(label,basestring): label = label.format(NAME=name,UNITS=units)
+    else: raise ValueError(label)
     return label
     
   def xTickLabels(self, xticks, n=None, loverlap=False):
@@ -851,11 +1032,12 @@ class MyAxes(Axes):
     xaxis = self.xaxis
     xticks = self._tickLabels(xticks, xaxis)
     yticks = self.yaxis.get_ticklabels()
-    # tick label position
-    if self.xtop: 
-      self.xaxis.set_tick_params(labeltop=True, labelbottom=False)
-    # minor ticks
-    if n is not None: self._minorTicks(xticks, n, xaxis)
+    if not self.ldatetime or self.flipxy:
+        # tick label position
+        if self.xtop: 
+          self.xaxis.set_tick_params(labeltop=True, labelbottom=False)
+        # minor ticks
+        if n is not None: self._minorTicks(xticks, n, xaxis)
     # tick label visibility
     if not loverlap and len(xticks) > 0 and (
         len(yticks) == 0 or not yticks[-1].get_visible() ):
@@ -870,13 +1052,14 @@ class MyAxes(Axes):
     if not loverlap and len(yticks) > 0 and (
         len(xticks) == 0 or not xticks[-1].get_visible() ):
         yticks[0].set_visible(False)
-    # tick label position
-    if self.yright:
-      self.yaxis.set_tick_params(labelleft=False) # always need to switch off on master yaxis
-      yaxis.set_tick_params(labelright=True, labelleft=False) # switch on on active yaxis
-    # minor ticks (apply to major and parasite axes)
-    for ax in self,self.parasite_axes:      
-      if ax and n is not None: self._minorTicks(yticks, n, ax.yaxis)
+    if not self.ldatetime or not self.flipxy:
+        # tick label position
+        if self.yright:
+          self.yaxis.set_tick_params(labelleft=False) # always need to switch off on master yaxis
+          yaxis.set_tick_params(labelright=True, labelleft=False) # switch on on active yaxis
+        # minor ticks (apply to major and parasite axes)
+        for ax in self,self.parasite_axes:      
+          if ax and n is not None: self._minorTicks(yticks, n, ax.yaxis)
     return yticks
   def _minorTicks(self, ticks, n, axis):
     ''' helper method to format axes ticks '''
@@ -944,9 +1127,251 @@ class MyAxes(Axes):
 
     
 # a new class that combines the new axes with LocatableAxes for use with AxesGrid 
-class MyLocatableAxes(LocatableAxes,MyAxes):
-  ''' A new Axes class that adds functionality from MyAxes to a LocatableAxes for use in AxesGrid '''
+class MyLocatableAxes(MyAxes,LocatableAxes):
+  ''' A new Axes class that adds functionality from MyAxes to LocatableAxes for use in AxesGrid '''
 
+
+# a new PolarAxes class that adds the new axes features to PolarAxes 
+class MyPolarAxes(MyAxes,PolarAxes):
+  ''' A new Axes class that adds functionality from MyAxes to PolarAxes '''
+  def __new__(self, *args, **kwargs):
+    return PolarAxes.__new__(self, *args, **kwargs)
+
+# a new child class of MyPolarAxes for drawing Taylor Diagrams
+from matplotlib.axes._subplots import subplot_class_factory
+from mpl_toolkits.axes_grid1.parasite_axes import host_axes_class_factory
+from mpl_toolkits.axisartist.axislines import Axes as ALaxes
+from mpl_toolkits.axisartist.floating_axes import floatingaxes_class_factory, GridHelperCurveLinear
+from mpl_toolkits.axisartist.grid_finder import FixedLocator, DictFormatter, MaxNLocator
+
+class TaylorAxes(MyAxes):
+    ''' 
+    An axes class specifically for drawing Taylor diagrams.
+    
+    The axes class that implements methods for drawing Taylor diagrams; this class is not used directly:
+    it is combined with several mix-in classes from Matplotlib in order to implement the specific requirements of 
+    the Taylor plot (specifically, only plotting the first quadrant).
+    
+    Taylor diagram reference (Taylor, 2001):
+    http://www-pcmdi.llnl.gov/about/staff/Taylor/CV/Taylor_diagram_primer.htm 
+    '''
+    
+    reference = None
+    ref_std   = None
+    ref_mean  = None
+    std_max   = 1.5  # set by kwarg during axes creation
+    _showgrid = False
+
+    def __new__(cls, fig, rect, std=1.5, leps=False,  **axes_args):
+        ''' Create a new PolarAxes instance following the method of Yannick Copin <yannick.copin@laposte.net> '''
+
+        
+        #print cls.__name__
+        if cls.__name__ == 'TaylorAxesSubplot': cls = cls._axes_class
+        # N.B.: if the class if constructed through add_subplot, there is already a Subplot axesclass mix-in,
+        #       which needs to be removed, to avoid conflicts when it is added back in later
+        
+        if cls.__name__ == 'TaylorAxes':
+        
+            # Correlation labels
+            rlocs = np.concatenate((np.arange(10)/10.,[0.95,0.99]))
+            tlocs = np.arccos(rlocs)        # Conversion to polar angles
+            gl1 = FixedLocator(tlocs)    # Positions
+            tf1 = DictFormatter(dict(zip(tlocs, map(str,rlocs))))
+            
+            # Standard Deviation labels
+#             std = np.float64(std)
+#             print type(std), np.finfo(type(std)).eps
+            eps = np.finfo(type(std)).eps # machine precision
+            if leps: std += eps
+            # N.B.: sometimes there are machine precision issues that cause the last tick to be larger than the axis limit
+            #       if both are supposed to have the same value; leps adds a machine-precision value to the axis limit
+            gl2 = MaxNLocator(9, prune=None); tf2 = None
+#             rlocs = MaxNLocator(9, prune=None).tick_values(0, std)
+#             gl2 = FixedLocator(rlocs) # Positions
+#             tf2 = DictFormatter(dict(zip(rlocs, ['{:3.2f}'.format(rloc) for rloc in rlocs])))
+            
+            tr = PolarAxes.PolarTransform()
+            ghelper = GridHelperCurveLinear(tr, extremes=(0,np.pi/2, 0,std), # 1st quadrant and std as radius
+                                            grid_locator1=gl1, tick_formatter1=tf1,  # theta
+                                            grid_locator2=gl2, tick_formatter2=tf2,) # radius
+
+            # figure out succession of class mix-ins
+            TA = type('TaylorGrid',(ALaxes,cls),{})
+            TA = host_axes_class_factory(TA)
+            TA = subplot_class_factory(TA)
+            TA = floatingaxes_class_factory(TA)
+            # create axes instance
+            ax = TA(fig, rect, grid_helper=ghelper)
+
+            # Adjust axes annotation
+            ax.axis["top"].set_axis_direction("bottom")  # "Angle axis"
+            ax.axis["top"].toggle(ticklabels=True, label=True)
+            ax.axis["top"].major_ticklabels.set_axis_direction("top")
+            ax.axis["top"].label.set_axis_direction("top")
+            ax.axis["top"].label.set_text("Correlation")
+            ax.axis["left"].set_axis_direction("bottom") # "X axis"
+            ax.axis["left"].label.set_text("Standard deviation")
+            ax.axis["right"].set_axis_direction("top")   # "Y axis"
+            ax.axis["right"].toggle(ticklabels=True)
+            ax.axis["right"].major_ticklabels.set_axis_direction("left")
+            ax.axis["bottom"].set_visible(False)         # Useless
+            # make sure the grid appears in the very back
+            ax.grid(zorder=-10)
+    
+            # get actual Polar coordinates            
+            ax.polaraxes = ax.get_aux_axes(tr)
+            # save rectilinear plot functions under backup name, and use polar plot function instead
+            ax._scatter = ax.scatter
+            ax.scatter = ax.polaraxes.scatter 
+            ax._plot = ax.plot
+            ax.plot = ax.polaraxes.plot
+            # store radius and eps
+            ax.std_max = std
+            ax.eps = eps 
+                      
+        else:
+        
+            # recursion terminates - MyAxes has default __new__
+            ax = MyAxes.__new__(cls, fig, rect, **axes_args)
+
+        # return axis instance
+        return ax
+      
+    def setReference(self, reference, varname=None, lignore=False, lprint=False, lnormalize=True, lparasiteMeans=True):
+        ''' Define a reference dataset w.r.t. which correlations and relative standard deviations are computed '''
+        reference = checkVarlist(reference, varname=varname, ndim=1, lignore=lignore, )
+        # this will also work with a single Variable or Dataset
+        assert len(reference) == 1, reference
+        reference = reference[0]
+        assert isinstance(reference, Variable)
+        self.reference = reference
+        self.ref_ts = reference.data_array # the reference array
+        self.ref_std = reference.std(asVar=False) # this is the radial axis scale
+        self.ref_mean = reference.mean(asVar=False) # needed for parasite axis with means 
+        # print feedback
+        if lprint: 
+            print(reference.name, self.ref_mean, self.ref_std)
+        # return foinspection, if desired
+        return self.reference
+        
+    def showRefLines(self, rmse=6, lnormalize=True, color='#959595', linestyle='--', linewidth=1, markersize=4,):
+        ''' Add reference lines for reference standard deviation and RMSE cirles '''
+        if self.reference is None: raise ArgumentError
+        # add some standard annotation
+        self.plot([0],[1 if lnormalize else self.ref_std],'ko', label='_', markersize=5, zorder=5)
+        t = np.linspace(0.,np.pi/2.)
+        r = np.ones_like(t) if lnormalize else np.zeros_like(t) + self.ref_std
+        self.plot(t,r, linestyle='-', color=color, linewidth=linewidth, label='_', zorder=-5)
+        # add cirles of constant RMSE
+        self.drawRMSE(rmse=rmse, lnormalize=lnormalize, color=color, linestyle=linestyle, linewidth=linewidth)
+        # indicate that grid has been drawn
+        self._showgrid = True
+        
+    def drawRMSE(self, rmse=6, lnormalize=True, color='#959595', linestyle='--', linewidth=1, **plotargs):
+        ''' Draw circles showing constant RMSE w.r.t. reference '''   
+        if self.reference is None: raise ArgumentError
+        # defaults
+        if isinstance(rmse, (int,np.integer)):
+            rmse = np.linspace(0,self.std_max,rmse+1)[1:] # [0.25, 0.5, 0.75, 1., 1.25, 1.5]
+            if not lnormalize: rmse = [r*self.ref_std for r in rmse]
+        s = 1 if lnormalize else self.ref_std # center point
+        # draw circles
+        for r in rmse:
+            x = np.concatenate( [np.linspace(1.-r+self.eps,1., 100), np.linspace(1.,1.+r-self.eps, 50)] ) # denser support near origin
+            y = np.sqrt( r**2 - (x-s)**2 ) # shifted half-circle in rectilinear coordinates
+            # plot using the original rectilinear plot function (easier)
+            self._plot(x,y, linestyle=linestyle, color=color, linewidth=linewidth, label='_', zorder=-5, **plotargs)        
+        
+    def taylorPlot(self, varlist, varname=None, legend=None, llabel=True, labels=None, title=None, 
+                   lparasiteMeans=False, lignore=False, rmse_lines=6, pval=0.05, linsig=False,
+                   xlabel=True, ylabel=True, xticks=True, yticks=True, reset_color=False, 
+                   lrescale=False, scalefactor=1., offset=0., lnormalize=True, labs=True,
+                   lprint=False, ldebug=False, std_lim=None, reference=None, loverride=False,
+                   expand_list=None, lproduct='inner', plotatts=None, corr_args=None, **plotargs):
+        ''' Compute standard deviation and correlation to reference data and add data points to Taylor diagram '''
+        ## check imputs and assign reference, if necessary
+        # check input
+        varlist = checkVarlist(varlist, varname=varname, ndim=1, lignore=lignore)
+        # figure out sensible plot labels
+        if labels is None: labels = self._getPlotLabels(varlist)
+        # identify and assign reference
+        if not reference and not self.reference: 
+            raise ArgumentError('No reference datset specified.')
+        elif reference and self.reference and not loverride: 
+            raise ArgumentError("Reference for Taylor diagram is already set! (use loverride=True to override reference)")
+        elif isinstance(reference,basestring):
+            # use one of the datasets in varlist as reference, identified by label 
+            if reference not in labels:
+                raise ArgumentError('Invalid reference label {}'.format(reference))
+            i = labels.index(reference) # search for label to use as reference
+            reference = varlist[i] # use this dataset as reference... 
+            del varlist[i]; del labels[i] # ... and remove from list
+            self.setReference(reference, varname=varname, lignore=lignore, lprint=lprint, lnormalize=lnormalize, lparasiteMeans=lparasiteMeans)
+        elif reference:
+            self.setReference(reference, varname=varname, lignore=lignore, lprint=lprint, lnormalize=lnormalize, lparasiteMeans=lparasiteMeans)
+        # make sure grid lines are shown
+        if not self._showgrid: 
+            self.showRefLines(rmse=rmse_lines, lnormalize=lnormalize,)                    
+        ## prepare input data (compute statistics)
+        # arguments for computation of correlation
+        cargs = dict(ignoreNaN=True, lstandardize=False)
+        if corr_args: cargs.update(corr_args)
+        # compute std and rho/corr
+        if plotatts is None: plotatts = dict()
+        stdlist = []; corrlist = []; meanlist = []
+        for label,var in zip(labels,varlist):
+            # correlation
+            if pval is None:
+                corr = pearsonr(var, self.reference, asVar=True, axes=var.axes, keepdims=True, lpval=False, lrho=True, **cargs)
+            else:
+                corr, pvar = pearsonr(var, self.reference, asVar=True, axes=var.axes, keepdims=True, lpval=True, lrho=True, **cargs)
+            # skip datasets with insignificant correlations
+            if linsig and pval is not None and pvar.mean() >= pval: 
+                # skip this dataset and move to next one
+                if lprint: print('Skipping {:s}: p={:3.2f} (cc={:3.2f})'.format(label,pvar.mean(),corr.mean(),))
+                corrlist.append(None); stdlist.append(None); meanlist.append(None) # None is a placeholder
+            else:
+                # invert negative correlations
+                if corr.mean() < 0:
+                    if labs: 
+                        corr *= -1
+                        warn("Inverting negative correlation ('{}').".format(label))
+                    else: warn("Negative correlation encountered ('{}'); use labs=True to invert.".format(label))
+                corr.data_array = np.arccos(corr.data_array)
+                corr.plot = None # don't rescale or anythinof that sort!
+                corrlist.append(corr) 
+                # assign significance via edge color (black means significant)
+                if pval is not None:
+                    if label not in plotatts: plotatts[label] = dict() 
+                    plotatts[label]['edgecolors'] = 'k' if pval and pvar.mean() < pval else 'none'
+                # std
+                std = var.std(asVar=True, axes=var.axes, keepdims=True)
+                if lnormalize: std /= self.ref_std
+                std.plot = None # don't rescale or anythinof that sort!
+                stdlist.append(std)
+                # means/biases
+                if lparasiteMeans or lprint:
+                    mean = var.mean(asVar=True, axes=var.axes, keepdims=True)
+                    if lnormalize: mean /= self.ref_mean
+                    mean.plot = None # don't rescale or anythinof that sort!
+                    meanlist.append(mean)
+                else: meanlist.append(None)
+                # print feedback
+                if lprint: 
+                    s = '{:s}: cc={:3.2f} (p={:3.2f}), std={:3.2f}, mean={:3.2f}'
+                    print(s.format(label,np.cos(corr.mean()),pvar.mean(),std.mean(),mean.mean()))
+        ## add data points to plot
+        # add elements of Taylor diagram 
+        plts = self.scatterPlot(xvars=corrlist, yvars=stdlist, legend=legend, llabel=llabel, labels=labels, title=title,  
+                                lignore=lignore, xlabel=xlabel, ylabel=ylabel, ylim=std_lim, xticks=xticks,  
+                                yticks=yticks, reset_color=reset_color, lrescale=lrescale, scalefactor=scalefactor, offset=offset,  
+                                lprint=ldebug, expand_list=expand_list, lproduct=lproduct, plotatts=plotatts, **plotargs)
+        # add parasite axes with means/relative biases
+        if lparasiteMeans:
+            raise NotImplementedError
+        # return plot handles
+        return plts
 
 if __name__ == '__main__':
     pass

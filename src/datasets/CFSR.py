@@ -13,20 +13,20 @@ import os
 from geodata.netcdf import DatasetNetCDF, Axis
 from geodata.misc import DatasetError
 from geodata.gdal import addGDALtoDataset, GridDefinition
-from datasets.common import translateVarNames, name_of_month, data_root, loadObservations, grid_folder
+from datasets.common import translateVarNames, name_of_month, getRootFolder, loadObservations, grid_folder
 from processing.process import CentralProcessingUnit
 
 
 ## CRU Meta-data
 
 dataset_name = 'CFSR'
-root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # long-term mean folder
+root_folder = getRootFolder(dataset_name=dataset_name) # get dataset root folder based on environment variables
 
 # CFSR grid definition           
 # geotransform_031 = (-180.15625, 0.3125, 0.0, 89.915802001953125, 0.0, -0.30960083)
 geotransform_031 = (-0.15625, 0.3125, 0.0, 89.915802001953125, 0.0, -0.30960083)
 size_031 = (1152,576) # (x,y) map size
-geotransform_05 = (-180.0, 0.5, 0.0, -90.0, 0.0, 0.5)
+# geotransform_05 = (-180.0, 0.5, 0.0, -90.0, 0.0, 0.5)
 geotransform_05 = (-0.25, 0.5, 0.0, 90.25, 0.0, -0.5) # this grid actually has a grid point at the poles!
 size_05 = (720,361) # (x,y) map size
 
@@ -48,7 +48,7 @@ varatts = dict(TMP_L103_Avg = dict(name='T2', units='K'), # 2m average temperatu
                LAND_L1 = dict(name='landmask', units=''), # land mask
                HGT_L1 = dict(name='zs', units='m'), # surface elevation
                # axes (don't have their own file; listed in axes)
-               time = dict(name='time', units='day', scalefactor=1/24.), # time coordinate
+               time = dict(name='time', units='day', scalefactor=1/24., offset=-6.), # time coordinate
                # N.B.: the time-series time offset is chose such that 1979 begins with the origin (time=0)
                lon  = dict(name='lon', units='deg E'), # geographic longitude field
                lat  = dict(name='lat', units='deg N')) # geographic latitude field
@@ -121,16 +121,17 @@ def loadCFSR_TS(name=dataset_name, grid=None, varlist=None, varatts=None, resolu
         files = [hiresstatic[var] for var in varlist if var in hiresstatic]
       elif resolution == 'lowres' or resolution == '05': 
         files = [lowresstatic[var] for var in varlist if var in lowresstatic]
-      # create singleton time axis
-      staticdata = DatasetNetCDF(name=name, folder=folder, filelist=files, varlist=varlist, varatts=varatts, 
-                                 axes=dict(lon=dataset.lon, lat=dataset.lat), multifile=False, 
-                                 check_override=['time'], ncformat='NETCDF4_CLASSIC')
-      # N.B.: need to override the axes, so that the datasets are consistent
-    if len(staticdata.variables) > 0:
-      for var in staticdata.variables.values(): 
-        if not dataset.hasVariable(var.name):
-          var.squeeze() # remove time dimension
-          dataset.addVariable(var, copy=False) # no need to copy... but we can't write to the netcdf file!
+      # load constants, if any (and with singleton time axis)
+      if len(files) > 0:
+        staticdata = DatasetNetCDF(name=name, folder=folder, filelist=files, varlist=varlist, varatts=varatts, 
+                                   axes=dict(lon=dataset.lon, lat=dataset.lat), multifile=False, 
+                                   check_override=['time'], ncformat='NETCDF4_CLASSIC')
+        # N.B.: need to override the axes, so that the datasets are consistent
+        if len(staticdata.variables) > 0:
+          for var in staticdata.variables.values(): 
+            if not dataset.hasVariable(var.name):
+              var.squeeze() # remove time dimension
+              dataset.addVariable(var, copy=False) # no need to copy... but we can't write to the netcdf file!
     # replace time axis with number of month since Jan 1979 
     data = np.arange(0,len(dataset.time),1, dtype='int16') # month since 1979 (Jan 1979 = 0)
     timeAxis = Axis(name='time', units='month', coord=data, atts=dict(long_name='Month since 1979-01'))
@@ -153,9 +154,10 @@ def loadCFSR_TS(name=dataset_name, grid=None, varlist=None, varatts=None, resolu
 avgfolder = root_folder + 'cfsravg/' 
 avgfile = 'cfsr{0:s}_clim{1:s}.nc' # the filename needs to be extended by %('_'+resolution,'_'+period)
 # function to load these files...
-def loadCFSR(name=dataset_name, period=None, grid=None, resolution=None, varlist=None, varatts=None, 
+def loadCFSR(name=dataset_name, period=None, grid=None, resolution='031', varlist=None, varatts=None, 
              folder=avgfolder, filelist=None, lautoregrid=True):
   ''' Get the pre-processed monthly CFSR climatology as a DatasetNetCDF. '''
+  grid, resolution = checkGridRes(grid=grid, resolution=resolution)
   # load standardized climatology dataset with CFSR-specific parameters
   dataset = loadObservations(name=name, folder=folder, projection=None, resolution=resolution,
                              period=period, grid=grid, shape=None, station=None, 
@@ -242,12 +244,12 @@ loadShapeTimeSeries = loadCFSR_ShpTS # time-series without associated grid (e.g.
 if __name__ == '__main__':
   
 #   mode = 'test_climatology'
-#   mode = 'average_timeseries'
+  mode = 'average_timeseries'
 #   mode = 'test_timeseries'
 #   mode = 'test_point_climatology'
-  mode = 'test_point_timeseries'
-  reses = ('031',) # for testing
-#   reses = ( '031','05',)
+#   mode = 'test_point_timeseries'
+#   reses = ('05',) # for testing
+  reses = ( '031','05',)
 #   period = (1979,1984)
 #   period = (1979,1989)
   period = (1979,1994)
@@ -337,8 +339,8 @@ if __name__ == '__main__':
       # shift longitude axis by 180 degrees left (i.e. 0 - 360 -> -180 - 180)
       CPU.Shift(lon=-180, flush=False)
       
-      # sync temporary storage with output
-      CPU.sync(flush=True)
+      # sync temporary storage with output (sink variable; do not flush!)
+      CPU.sync(flush=False)
 
       # make new masks
       if sink.hasVariable('landmask'):

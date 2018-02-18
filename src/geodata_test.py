@@ -6,13 +6,12 @@ Unittest for the GeoPy main package geodata.
 @author: Andre R. Erler, GPL v3
 '''
 
-import unittest
+import unittest, os, gc, shutil
+from copy import deepcopy
 import netCDF4 as nc
 import numpy as np
 import numpy.ma as ma
 import scipy.stats as ss
-import os
-import gc
 
 # import modules to be tested
 import utils.nanfunctions as nf
@@ -23,15 +22,14 @@ from geodata.stats import VarKDE, VarRV, asDistVar
 from geodata.stats import kstest, ttest, mwtest, wrstest, pearsonr, spearmanr
 from datasets.common import data_root
 from wrfavg.wrfout_average import ldebug
-from copy import deepcopy
-import shutil
 
 # work directory settings ("global" variable)
 # the environment variable RAMDISK contains the path to the RAM disk
 RAM = bool(os.getenv('RAMDISK', '')) # whether or not to use a RAM disk
 # either RAM disk or data directory
-workdir = os.getenv('RAMDISK', '') if RAM else '{:s}/test/'.format(os.getenv('DATA_ROOT', '')) 
-if not os.path.isdir(workdir): raise IOError, workdir
+workdir = os.getenv('RAMDISK', '') if RAM else os.getenv('DATA_ROOT', '')
+# workdir += 'test/' # test folder 
+if not os.path.exists(workdir): raise IOError(workdir)
 
 class BaseVarTest(unittest.TestCase):  
   
@@ -54,7 +52,7 @@ class BaseVarTest(unittest.TestCase):
     #print data
     self.data = data
     # create axis instances
-    t = Axis(name='time', units='month', coord=(1,te,te))
+    t = Axis(name='time', units='month', coord=(0,te-1,te)) # January == 0
     y = Axis(name='y', units='none', coord=(1,ye,ye))
     x = Axis(name='x', units='none', coord=(1,xe,xe))
     self.axes = (t,y,x)
@@ -548,12 +546,12 @@ class BaseVarTest(unittest.TestCase):
     else:
       # crop data because these tests just take way too long!
       if self.dataset_name == 'NARR':
-        var = self.var(time=slice(0,5), y=slice(190,195), x=slice(0,10))
+        var = self.var(y=slice(190,195), x=slice(0,10))
       else:
-        var = self.var(time=slice(0,5), lat=(50,70), lon=(-120,-110))
+        var = self.var(lat=(50,70), lon=(-120,-110))
     print('') # generic version with cell dimension
     t,x,y = var.axes
-    print var.tabulate(row=y.name, column=x.name, header=None, labels=None, 
+    print var(time=slice(0,5), lidx=True).tabulate(row=y.name, column=x.name, header=None, labels=None, 
                        cell_str='{0:}', cell_axis=t.name, mode='simple', filename=None)
     print('') # generic version without cell dimension
     print var(time=0, lidx=True).tabulate(row=y.name, column=x.name, header=None, labels=None, 
@@ -698,7 +696,7 @@ class BaseVarTest(unittest.TestCase):
       assert cvar.shape != var.shape and cvar.shape == svar.shape
       assert isEqual(svar.data_array, cvar.data_array)
       # test climatological sample (need time-axis in month)
-      svar = var.climSample(asVar=True, linplace=False, lstrict=lstrict)
+      svar = var.climSample(asVar=True, linplace=False, lstrict=lstrict, lpad=lstrict)
       assert svar.ndim == var.ndim+1
       assert len(svar.getAxis('time')) == 12 
       assert len(var.getAxis('time')) == len(svar.getAxis('sample'))*12
@@ -712,7 +710,7 @@ class BaseVarTest(unittest.TestCase):
       # test in-place extraction
       cvar = var.copy(deepcopy=True)
       assert cvar.shape == var.shape
-      cvar.climSample(asVar=True, linplace=True, lstrict=lstrict)
+      cvar.climSample(asVar=True, linplace=True, lstrict=lstrict, lpad=lstrict)
       assert cvar.shape != var.shape and cvar.shape == svar.shape
       assert isEqual(svar.data_array, cvar.data_array)
       
@@ -753,8 +751,8 @@ class BaseVarTest(unittest.TestCase):
     stdvar = trendvar.standardize(linplace=False, name='{}_test', axis='time', lstandardize=False, ldetrend=True, lsmooth=True)
     assert stdvar.shape == var.shape
     assert stdvar.name == var.name+'_test'
-    assert stdvar.mean() < trendvar.mean()
-    assert stdvar.std() < trendvar.std()
+    assert stdvar.mean() < trendvar.mean(), (stdvar.mean(),trendvar.mean())
+    assert stdvar.std() < trendvar.std(), (stdvar.std(),trendvar.std())
     # now standardize in-place
     name = var.name
     var.standardize(linplace=True, axis=None, lstandardize=True, ldetrend=False, lsmooth=False) # make variables more likely to test positive
@@ -764,14 +762,14 @@ class BaseVarTest(unittest.TestCase):
     all_axis = tuple(ax.name for ax in var.axes)
     # run simple kstest test
     pval = var.kstest(asVar=False, lflatten=True, axis=None, dist='norm', args=(0,1))    
-    assert pval >= 0 # this will usually be close to zero, since none of these are normally distributed
+    assert pval >= 0, pval # this will usually be close to zero, since none of these are normally distributed
     # check that merging all axes gives the same result as flattening
     all_pval = var.kstest(asVar=False, lflatten=False, axis=all_axis, dist='norm', args=(0,1))
-    assert pval == all_pval 
+    assert pval == all_pval, (pval,all_pval)
     # Anderson-Darling test
     pval = var.anderson(asVar=False, lflatten=True, dist='extreme1')    
     #print pval
-    assert pval >= 0 # this will usually be close to zero, since none of these are normally distributed  
+    assert pval >= 0, pval # this will usually be close to zero, since none of these are normally distributed  
     # run variable test (normaltest)
     pvar = var.normaltest(asVar=True, axis='time', lflatten=False)
     assert pvar.shape == var.shape[1:]
@@ -782,7 +780,7 @@ class BaseVarTest(unittest.TestCase):
     # fit normal distribution over entire range 
     nvar = var.norm(axis=t.name, lflatten=True, ldebug=False)
     pval = nvar.fittest(var.data_array.ravel(), asVar=False) # should use normaltest
-    assert pval >= 0.
+    assert pval >= 0., pval
     assert pval.shape == nvar.shape[:-1]
     xvar = var.genextreme(axis=t.name, lflatten=False, ldebug=False)
     pvar = xvar.fittest(var) # should use K-S test
@@ -790,12 +788,12 @@ class BaseVarTest(unittest.TestCase):
     assert np.all(pvar.data_array >= 0)
     del xvar, pvar, nvar; gc.collect()
 
-    rav = var.copy(); sin = rav.sin(); cos = var.cos()
+    rav = var.copy(deepcopy=True); sin = rav.sin(); cos = var.cos()
     ## bivariate stats tests
     pval = kstest(var, rav, lflatten=True, axis=None, asVar=False)
-    assert pval > 0.95 # this will usually be close to zero, since none of these are normally distributed
+    assert pval > 0.95, pval # this will be large, since they are the same
     alt_pval = kstest(var, rav, lflatten=False, axis=all_axis, asVar=False)
-    assert pval == alt_pval
+    assert pval == alt_pval, (pval,all_pval)
     pvar = ttest(var, rav, axis='time')    
     #print pvar
     #print pvar.data_array
@@ -814,8 +812,8 @@ class BaseVarTest(unittest.TestCase):
     rnd = var.copy(); rnd.data_array = np.random.randn(var.data_array.size).reshape(var.shape)
     rho,pval = pearsonr(var, rav, lpval=True, lrho=True, lflatten=True, lstandardize=True, lsmooth=True, window_len=5)
     #print rho, pval
-    assert rho > 0.99
-    assert pval < 0.01 # this will usually be close to zero, since none of these are normally distributed
+    assert rho > 0.99, rho
+    assert pval < 0.01, pval # this will usually be close to zero, since the timeseries are the same
     rvar,pvar = spearmanr(var, rav, lpval=True, lrho=True, axis='time', lstandardize=True, lsmooth=True)
     assert rvar.data_array.mean() > 0.95 # not all tests are that accurate...
     assert pvar.data_array.mean() < 0.05 # not all tests are that accurate...
@@ -1177,7 +1175,7 @@ class BaseDatasetTest(unittest.TestCase):
     # select variables
     var2 = dataset[self.lar.name] if self.lar is not None else None; 
     var3 = dataset[self.var.name]
-    if len(dataset.axes) == 3:
+    if var3.ndim == 3:
       # get axis that is not in var2 first
       ax0, ax1, ax2 = var3.axes
       co0 = ax0.coord; co1 = ax1.coord; co2 = ax2.coord
@@ -1279,7 +1277,7 @@ class BaseDatasetTest(unittest.TestCase):
           else: 
             raise AssertionError
           assert avar.shape == var.shape
-    else: raise AssertionError
+    else: raise AssertionError, dataset
 
   def testPrint(self):
     ''' just print the string representation '''
@@ -1568,7 +1566,12 @@ class DatasetNetCDFTest(BaseDatasetTest):
 
 # import modules to be tested
 from geodata.gdal import addGDALtoVar, addGDALtoDataset
-from datasets.NARR import projdict
+# NARR projection (avoid dependency)
+projdict = dict(proj  = 'lcc', # Lambert Conformal Conic  
+                lat_1 =   50., # Latitude of first standard parallel
+                lat_2 =   50., # Latitude of second standard parallel
+                lat_0 =   50., # Latitude of natural origin
+                lon_0 = -107.) # Longitude of natural origin
 
 class GDALVarTest(NetCDFVarTest):  
   
@@ -1627,13 +1630,93 @@ class GDALVarTest(NetCDFVarTest):
       assert not slcvar.gdal 
     # do standard tests
     super(GDALVarTest,self).testIndexing()
+
+  def testMapReduction(self):
+    # test mapMean
+    var = self.var
+    if var.ndim >= 3:
+      assert var.gdal 
+      # find any map and non-map axis
+      noax = []; mapax = []
+      for ax in var.axes:
+        if ax != var.xlon and ax != var.ylat: noax.append(ax)
+        else: mapax.append(ax)
+      # compute map mean
+      mvar = var.mapMean()
+      assert mvar.ndim+2 == var.ndim, mvar
+      assert mvar.shape == var.shape[:-2], mvar
+      # compare
+      if not var.isProjected and var.name == 'p':
+          assert mvar.mean() > var.mean(), mvar
+
+  def testReadASCII(self):
+    ''' test function to read Arc/Info ASCII Grid / ASCII raster files '''
+    from utils.ascii import readASCIIraster, rasterVariable
+    # get folder with test data
+    ascii_folder = workdir+'/nrcan_test/'
+    print("ASCII raster test folder: '{:s}'".format(ascii_folder)) # print data folder
+    if not os.path.exists(ascii_folder): 
+      raise IOError("\nASCII raster test folder does not exist!\n('{:s}')".format(ascii_folder))
+    
+    ## simple case: load a single compressed 2D raster file
+    filepath = ascii_folder+'/CA12_hist/rain/1981/rain_01.asc.gz'
+    #filepath = ascii_folder+'test.asc.gz'
+    print("ASCII raster test file: '{:s}'".format(filepath)) # print data folder
+    if not os.path.exists(filepath): 
+      raise IOError("\nASCII raster 2D test file does not exist!\n('{:s}')".format(filepath))
+    data2D, geotransform2D = readASCIIraster(filepath, lgzip=None, lgdal=True, dtype=np.float, lmask=True, 
+                                         fillValue=None, lgeotransform=True, lna=False)
+    #print data.shape, geotransform
+    assert data2D.ndim == 2
+    assert np.any(data2D.mask), data2D
+    
+#     ## multi-dimensional case: load a bunch of compressed 2D raster files
+#     file_pattern = ascii_folder+'/CA_hist/rain/{YEAR:04d}/rain_{MONTH:02d}.asc.gz'
+#     years = [1980,1981,1982,1983]; months = range(1,13)
+#     #filepath = ascii_folder+'test.asc.gz'
+#     print("ASCII raster test file pattern: '{:s}'".format(file_pattern)) # print data folder
+#     filepath = file_pattern.format(YEAR=years[1],MONTH=months[0])
+#     if not os.path.exists(filepath): 
+#       raise IOError("\nASCII raster test file does not exist!\n('{:s}')".format(filepath))
+#     data, geotransform = readRasterArray(file_pattern, YEAR=years, MONTH=months, axes=['YEAR','MONTH'], 
+#                                          lgzip=None, lgdal=True, dtype=np.float, lmask=True, 
+#                                          fillValue=None, lgeotransform=True, lskipMissing=True)
+    
+    ## test Variable creation from rasters (includes multi-dimensional raster)
+    # create axes
+    years = Axis(name='year', units='year', coord=range(1,5)) # year starting in 1979 as origin
+    assert len(years)==4, years
+    months = Axis(name='month',units='month', coord=range(1,12+1))
+    assert len(months)==12, months
+    axes = (years, months, None, None)
+    file_pattern = ascii_folder+'/CA12_hist/rain/{year:04d}/{NAME:s}_{month:02d}.asc.gz'
+    # load variable
+    var = rasterVariable(name='precip', units='mm/day', axes=axes, atts=None, plot=None, dtype=np.float32, 
+                         projection=None, griddef=None, # geographic projection (lat/lon)
+                         file_pattern=file_pattern, lgzip=None, lgdal=True, lmask=True, fillValue=None, 
+                         lskipMissing=True, year=range(1980,1983+1), path_params=dict(NAME='rain'))
+    assert np.all( var.axes[0].coord == np.arange(1,5) ), var.axes[0].coord 
+    data, geotransform = var.data_array, var.geotransform
+    #print data.shape, geotransform
+    #print data.mask.sum(),data.mask.size
+    #print data.mask[0,:].sum(),data.mask[0,:].size
+    #print data.mask[1,:].sum(),data.mask[1,:].size
+    assert geotransform == geotransform2D, geotransform
+    assert data.shape[-2:] == data2D.shape, data.shape
+    assert data.shape[:-2] == (len(years),len(months)), data.shape
+    # N.B.: we only want to load 1981 and 1982; 1980 and 1983 are only loaded to test missing value detection; therefor 
+    #       the first and the last year should be missing entirely and the other years should have the expected mask
+    assert np.all(data.mask[0,:] == True), (np.sum(data.mask[0,:]),data.mask[0,:].size)
+    assert np.all(data.mask[1,:] == data2D.mask), data.mask[1,:]
+    assert np.all(data.mask[2,:] == data2D.mask), data.mask[2,:]
+    assert np.all(data.mask[3,:] == True), data.mask[3,:]
     
   def testWriteASCII(self):
     ''' test function to write Arc/Info ASCII Grid / ASCII raster files '''
     # get test objects
     var = self.var # NCVar object
     var = var(time=slice(0,100,10)) # not too much...
-    # prepare folder for tes data
+    # prepare folder for test data
     folder = '{:s}/ASCII_raster/'.format(workdir)
     print("\nASCII_raster folder: '{:s}'".format(folder)) # print data folder
     if os.path.exists(folder): shutil.rmtree(folder)
@@ -1711,6 +1794,56 @@ class DatasetGDALTest(DatasetNetCDFTest):
     # do standard tests
     super(DatasetGDALTest,self).testIndexing()
     
+  def testMapReduction(self):
+    # test mapMean
+    dataset = self.dataset.load() # dataset object
+    assert dataset.gdal 
+    # find any map and non-map axis
+    noax = []; mapax = []
+    for ax in dataset.axes:
+      if ax != dataset.xlon and ax != dataset.ylat: noax.append(ax)
+      else: mapax.append(ax)
+    # compute map mean
+    mds = dataset.mapMean()
+    for mvar in mds:
+        var = dataset[mvar.name]
+        if var.hasAxis(dataset.xlon.name) and var.hasAxis(dataset.ylat.name):
+            assert mvar.ndim+2 == var.ndim, mvar
+            assert mvar.shape == var.shape[:-2], mvar
+            # compare
+            if not var.isProjected and var.name == 'p':
+                assert mvar.mean() > var.mean(), mvar
+
+  def testReadASCII(self):
+    ''' test function to read Arc/Info ASCII Grid / ASCII raster files '''
+    from utils.ascii import rasterDataset
+    # get folder with test data
+    ascii_folder = workdir+'/nrcan_test/'
+    print("ASCII raster test folder: '{:s}'".format(ascii_folder)) # print data folder
+    if not os.path.exists(ascii_folder): 
+      raise IOError("\nASCII raster test folder does not exist!\n('{:s}')".format(ascii_folder))
+        
+    ## test Variable creation from rasters (includes multi-dimensional raster)
+    # axes definitions
+    axdefs = dict()
+    axdefs['year']  = dict(name='year', units='year', coord=range(1,5)) # year starting in 1979 as origin
+    axdefs['month'] = dict(name='month',units='month', coord=range(1,12+1))
+    # variables definitions
+    vardefs = dict()
+    vardefs['rain'] = dict(name='precip', units='mm/day', axes=('year','month','lat','lon'), 
+                           dtype=np.float32, path_params=dict(NAME='rain') )
+    vardefs['rain_alt'] = dict(name='precip_alt', units='mm/day', axes=('year','month',None,None), 
+                               dtype=np.float32, path_params=dict(NAME='rain') )
+    # path definition
+    file_pattern = ascii_folder+'/CA12_hist/{NAME:s}/{year:04d}/{NAME:s}_{month:02d}.asc.gz'
+    # load variable
+    dataset = rasterDataset(name='NRCAN', title='NRCan', atts=None, projection=None, griddef=None, # geographic projection (lat/lon)
+                            vardefs=vardefs, axdefs=axdefs, file_pattern=file_pattern, 
+                            lgzip=None, lgdal=True, lmask=True, fillValue=None, lskipMissing=True, year=range(1980,1983+1))
+    print dataset
+    assert dataset.gdal
+    assert 'lon' in dataset.axes and 'lat' in dataset.axes
+    
   def testWriteASCII(self):
     ''' test function to write Arc/Info ASCII Grid / ASCII raster files '''
     # get test objects
@@ -1751,11 +1884,12 @@ if __name__ == "__main__":
     specific_tests = []
 #     specific_tests += ['LoadSlice']
 #     specific_tests += ['WriteASCII']
+#     specific_tests += ['ReadASCII']
 #     specific_tests += ['ReductionArithmetic']
 #     specific_tests += ['Mask']
 #     specific_tests += ['Ensemble']
-#     specific_tests += ['DistributionVariables']
-#     specific_tests += ['StatsTests']   
+    specific_tests += ['DistributionVariables']
+    specific_tests += ['StatsTests']   
 #     specific_tests += ['UnaryArithmetic']
 #     specific_tests += ['BinaryArithmetic']
 #     specific_tests += ['Copy']
@@ -1763,6 +1897,7 @@ if __name__ == "__main__":
 #     specific_tests += ['AddProjection']
 #     specific_tests += ['Indexing']
 #     specific_tests += ['SeasonalReduction']
+#     specific_tests += ['MapReduction']
 #     specific_tests += ['ConcatVars']
 #     specific_tests += ['ConcatDatasets']
 #     specific_tests += ['Print']

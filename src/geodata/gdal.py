@@ -14,7 +14,11 @@ import numpy as np
 import numpy.ma as ma
 from collections import OrderedDict
 import types  # needed to bind functions to objects
-import pickle
+import os, gzip # griddef pickles compress well
+try: import cPickle as pickle
+except: import pickle
+
+
 # gdal imports
 from osgeo import gdal, osr, ogr
 from utils.misc import flip
@@ -25,17 +29,47 @@ gdal.UseExceptions()
 osr.UseExceptions()
 ogr.UseExceptions()
 # set default environment variable to prevent problems in IPython Notebooks
-import os
 os.environ.setdefault('GDAL_DATA','/usr/local/share/gdal')
 
 # import all base functionality from PyGeoDat
 from geodata.base import Variable, Axis, Dataset
-from geodata.misc import separateCamelCase, printList, isEqual, isInt, isFloat, isNumber ,\
-  ArgumentError
+from geodata.misc import printList, isEqual, isInt, isFloat, isNumber , ArgumentError,\
+  VariableError
 from geodata.misc import DataError, AxisError, GDALError, DatasetError
 
+# read data root folder from environment variable
+data_root = os.getenv('DATA_ROOT')
+if not data_root: raise ArgumentError('No DATA_ROOT environment variable set!')
+if not os.path.exists(data_root): 
+  raise DataError("The data root '{:s}' directory set in the DATA_ROOT environment variable does not exist!".format(data_root))
 
-# # utility functions and classes to handle projection information and related meta data
+# standard folder for grids and shapefiles (imported by datasets.common)
+grid_folder = data_root + '/grids/' # folder for pickled grids
+shape_folder = data_root + '/shapes/' # folder for pickled grids
+
+# Earth's radius
+R = 6371000 # in meters, from Wikipedia
+
+## utility functions and classes to handle projection information and related meta data
+
+
+# metric for spherical coordinates
+def sphericalMetric(ylat, integral=False, R=R, asVar=True):
+    ''' create a metric for spherical coordinates, based on latitude vector '''
+    if ylat.max() > 90 and ylat.min() > -90: 
+        raise AxisError(ylat)
+    metric = np.cos(ylat[:]*np.pi/180.)
+    if integral: 
+      metric *= (4*np.pi*R**2)/metric.mean() # normalize by area of sphere
+      units = 'm^2'; name = 'area' # Radius is in meters, area units
+    else: 
+      metric /= metric.mean() # just normalize axis
+      units = ''; name = 'metric' # no units, just weighing factors
+    # create variable object
+    if asVar: 
+        metric = Variable(data=metric, axes=(ylat,), name=name, units=units)
+    # return metric
+    return metric
 
 # utility function to check if longitude runs from 0 to 360, instead of -180 - 180
 def checkWrap360(lwrap360, xlon):
@@ -146,7 +180,7 @@ class GridDefinition(object):
       if geolocator:
         x2D, y2D = np.meshgrid(xlon.coord, ylat.coord) # if we have x/y arrays
         xx = x2D.flatten().astype(np.float64); yy = y2D.flatten().astype(np.float64)
-        lon2D = np.zeros_like(xx); lat2D = np.zeros_like(yy) 
+        lon2D = np.zeros_like(xx, dtype=np.float32); lat2D = np.zeros_like(yy, dtype=np.float32) 
         #for i in xrange(xx.size):
         #  (lon2D[i],lat2D[i],tmp) = tx.TransformPoint(xx[i],yy[i])
         # N.B.: apparently TransformPoints is not much faster than a simple loop... 
@@ -154,12 +188,13 @@ class GridDefinition(object):
         #print point_array.shape; print point_array[:3,:]
         point_array = np.asarray(tx.TransformPoints(point_array.astype(np.float64)), dtype=np.float32)
         #print tmp.shape; print tmp[:3,:] # (lon2D,lat2D,zzz)
-        lon2D = point_array[:,0]; lat2D = point_array[:,1] 
+        lon2D[:] = point_array[:,0]; lat2D[:] = point_array[:,1] 
         lon2D = lon2D.reshape(x2D.shape); lat2D = lat2D.reshape(y2D.shape)
     else:
       self.scale = ( geotransform[1] + geotransform[5] ) / 2 # pretty straight forward
       if geolocator:
         lon2D, lat2D = np.meshgrid(xlon.coord, ylat.coord) # if we have x/y arrays
+        lon2D = lon2D.astype(np.float32); lat2D = lat2D.astype(np.float32) # astype always returns a newly allocated copy
     # set geotransform/axes attributes
     self.xlon = xlon
     self.ylat = ylat
@@ -226,50 +261,71 @@ def getGridDef(var):
                         size=var.mapSize, xlon=var.xlon, ylat=var.ylat)
 
 
+## gid pickle functions
+griddef_pickle = '{0:s}_griddef.pickle.gz' # file pattern for pickled grids
+
 # function to load pickled grid definitions
-griddef_pickle = '{0:s}_griddef.pickle' # file pattern for pickled grids
-def loadPickledGridDef(grid=None, res=None, filename=None, folder=None, check=True, lfilepath=False):
+def loadPickledGridDef(grid=None, res=None, filename=None, folder=None, check=True, lfilepath=False, lgzip=None):
   ''' function to load pickled datasets '''
-  if grid is not None and not isinstance(grid,basestring): raise TypeError
-  if res is not None and not isinstance(res,basestring): raise TypeError
-  if filename is not None and not isinstance(filename,basestring): raise TypeError
-  if folder is not None and not isinstance(folder,basestring): raise TypeError
+  if grid is not None and not isinstance(grid,basestring): raise TypeError(grid)
+  if res is not None and not isinstance(res,basestring): raise TypeError(res)
+  if filename is not None and not isinstance(filename,basestring): raise TypeError(filename)
+  if folder is not None and not isinstance(folder,basestring): raise TypeError(folder)
   # figure out filename
   if filename is None:
-    tmp = '{0:s}_{1:s}'.format(grid,res) if res else grid
-    filename = griddef_pickle.format(tmp)
-  if folder is not None: 
-    filepath = '{0:s}/{1:s}'.format(folder,filename)
+    filename = griddef_pickle.format('{0:s}_{1:s}'.format(grid,res) if res else grid)
+  filepath = '{0:s}/{1:s}'.format(grid_folder if folder is None else folder,filename)
+  # figure out compression
+  fpgz =  filepath if filename.endswith('.gz') else filepath + '.gz'
+  fp = filepath[:-3] if filename.endswith('.gz') else filepath
+  if lgzip is None:
+    if os.path.exists(fpgz) and ( filename.endswith('.gz') or not os.path.exists(fp) ): 
+        lgzip = True; filepath = fpgz # use gzipped pickle if file ends in gz or other file is not present  
+    elif os.path.exists(fp) and ( not filename.endswith('.gz') or not os.path.exists(fpgz) ): 
+        lgzip = False; filepath = fp # use unzipped pickle is file doesn't end in gz or gzipped pickle doen't exist
+    elif check:
+        raise ArgumentError("Unable to infer gzip option; it appears neither the gzipped nor the unzipped file are present:\n'{}'".format(filepath))
+  elif lgzip and os.path.exists(fpgz): filepath = fpgz
+  elif not lgzip and filename.endswith('.gz'): 
+      raise ValueError("The file extension '.gz' suggests a compressed pickle file, yet lgzip=False...")
   # load pickle
   if os.path.exists(filepath):
-    filehandle = open(filepath, 'r')
-    griddef = pickle.load(filehandle)
-    filehandle.close()
+      # open file and load pickle
+      op = gzip.open if lgzip else open
+      with op(filepath, 'r') as filehandle:
+          griddef = pickle.load(filehandle)
   elif check: 
-    raise IOError, "GridDefinition pickle file '{0:s}' not found!".format(filepath) 
+      raise IOError, "GridDefinition pickle file '{0:s}' not found!".format(filepath) 
   else:
-    griddef = None
+      griddef = None
   # add path of pickle file, if desired
   if griddef and lfilepath: 
-    griddef.filepath = filepath # monkey-patch...
+      griddef.filepath = filepath # monkey-patch...
   # return
   return griddef
+
 # save GridDef to pickle
-def pickleGridDef(griddef=None, folder=None, filename=None, lfeedback=True):
+def pickleGridDef(griddef=None, folder=None, filename=None, loverwrite=True, lfeedback=True, lgzip=None):
   ''' function to pickle griddefs in a standardized way '''
   if not isinstance(griddef,GridDefinition): raise TypeError
-  if filename is not None and not isinstance(filename,basestring): raise TypeError
-  if folder is not None and not isinstance(folder,basestring): raise TypeError
+  if filename is not None and not isinstance(filename,basestring): raise TypeError(filename)
+  if folder is not None and not isinstance(folder,basestring): raise TypeError(folder)
   # construct name
   filename = griddef_pickle.format(griddef.name) if filename is None else filename
   filepath = '{0:s}/{1:s}'.format(grid_folder if folder is None else folder,filename)
+  # figure out compression
+  if lgzip is None: lgzip = filename.endswith('.gz')
+  elif lgzip and not filename.endswith('.gz'): filename += '.gz'
+  elif not lgzip and filename.endswith('.gz'): 
+    raise ValueError("The file extension '.gz' suggests a compressed pickle file, yet lgzip=False")
   # open file and save pickle
-  filehandle = open(filepath, 'w')
-  pickle.dump(griddef, filehandle)
-  filehandle.close()
+  if os.path.exists(filepath): os.remove(filepath)
+  op = gzip.open if lgzip else open
+  with op(filepath, 'wb') as filehandle:
+      pickle.dump(griddef, filehandle)
   # print some feedback
   if not os.path.exists(filepath):
-    raise IOError, "Error while saving Pickle to '{0:s}'".format(filepath)
+      raise IOError, "Error while saving Pickle to '{0:s}'".format(filepath)
   elif lfeedback: print("   Saved Pickle to '{0:s}'".format(filepath))
   # return filename
   return filepath
@@ -283,13 +339,13 @@ def addGeoLocator(dataset, griddef=None, lcheck=True, asNC=True, lgdal=False, lr
   axes = (griddef.ylat,griddef.xlon)
   # add longitude field
   if lreplace or not dataset.hasVariable('lon2D'):
-    lon2D = Variable('lon2D', units='deg E', axes=axes, data=griddef.lon2D)
+    lon2D = Variable('lon2D', units='deg E', axes=axes, data=griddef.lon2D, dtype=np.float32)
     if dataset.hasVariable('lon2D'): dataset.replaceVariable(lon2D, deepcopy=True, asNC=asNC)
     else: dataset.addVariable(lon2D, deepcopy=True, asNC=asNC)
   elif lcheck: raise DatasetError
   # add latitude field
   if lreplace or not dataset.hasVariable('lat2D'):
-    lat2D = Variable('lat2D', units='deg N', axes=axes, data=griddef.lat2D)
+    lat2D = Variable('lat2D', units='deg N', axes=axes, data=griddef.lat2D, dtype=np.float32)
     if dataset.hasVariable('lat2D'): dataset.replaceVariable(lat2D, deepcopy=True, asNC=asNC)
     else: dataset.addVariable(lat2D, deepcopy=True)
   elif lcheck: raise DatasetError
@@ -380,11 +436,14 @@ def getProjection(var, projection=None):
       #       be treated as a GDAL variable, because their geotransform would be different
   # if the variable is map-like, add GDAL properties
   if xlon is not None and ylat is not None:
-    lgdal = True
     # check axes
     axstr = "'x' and 'y'" if isProjected else "'lon' and 'lat'"
     if not isinstance(xlon, Axis) and not isinstance(ylat, Axis): 
       raise AxisError, "Error: attributes {:s} have to be axes.".format(axstr)
+    # check map axes order for variables
+    if isinstance(var,Variable):
+        lgdal = ( var.axes[-2] == ylat and var.axes[-1] == xlon ) # we need the (y,x) or (lat,lon) order for the map
+    else: lgdal = True # for datasets the order does not matter
   else: lgdal = False   
   # return
   return lgdal, projection, isProjected, xlon, ylat
@@ -407,7 +466,8 @@ def getAxes(geotransform, xlen=0, ylen=0, projected=False):
 
 
 def getGeotransform(xlon=None, ylat=None, geotransform=None):
-  ''' Function to check or infer GDAL geotransform from coordinate axes. '''
+  ''' Function to check or infer GDAL geotransform from coordinate axes. 
+      Note that due to machine-precision errors, recomputing the geotransform from coordinates can cause problems. '''
   if geotransform is None:  # infer geotransform from axes
     if not isinstance(ylat, Axis) or not isinstance(xlon, Axis): raise TypeError     
     if xlon.data and ylat.data:
@@ -422,21 +482,25 @@ def getGeotransform(xlon=None, ylat=None, geotransform=None):
     geotransform = tuple(float(f) for f in geotransform)
     if xlon.data or ylat.data:
       # check if GDAL geotransform vector is consistent with coordinate vectors
-      assert len(geotransform) == 6, '\'geotransform\' has to be a vector or list with 6 elements.'
+      if not len(geotransform) == 6:
+        raise GDALError('\'geotransform\' has to be a vector or list with 6 elements.')
       dx = geotransform[1]; dy = geotransform[5]; ulx = geotransform[0]; uly = geotransform[3] 
       # assert isZero(np.diff(xlon)-dx) and isZero(np.diff(ylat)-dy), 'Coordinate vectors have to be compatible with geotransform!'
       #print geotransform
       #print ulx + dx / 2., xlon[0], uly + dy / 2., ylat[0]
-      assert isEqual(ulx + dx / 2., float(xlon[0])) and isEqual(uly + dy / 2., float(ylat[0]))  # coordinates of upper left corner (same for source and sink)       
+      # coordinates of upper left corner (same for source and sink)       
+      if not isEqual(ulx, float(xlon[0]) - dx / 2.): raise GDALError('{} != {}'.format(ulx, float(xlon[0]) - dx / 2.))
+      if not isEqual(uly, float(ylat[0]) - dy / 2.): raise GDALError('{} != {}'.format(uly, float(ylat[0]) - dy / 2.))
     else: 
-      assert len(geotransform) == 6 and all(isFloat(geotransform)), '\'geotransform\' has to be a vector or list of 6 floating-point numbers.'
+      if not ( len(geotransform) == 6 and all(isFloat(geotransform)) ):
+        raise GDALError('\'geotransform\' has to be a vector or list of 6 floating-point numbers.')
   # return results
   return geotransform
 
 
 ## functions to add GDAL functionality to existing Variable and Dataset instances
 
-def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfolder=None):
+def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfolder=None, loverride=False):
   ''' 
     A function that adds GDAL-based geographic projection features to an existing Variable instance.
     
@@ -455,18 +519,23 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
   # check some special conditions
   if not isinstance(var, Variable): 
     raise TypeError, 'This function can only be used to add GDAL functionality to \'Variable\' instances!'
+  
+  ## skip, if already GDAL-ensembled (and not in override mode)
+  if not loverride and 'gdal' in var.__dict__: 
+      return var# return immediately
+    
   # only for 2D variables!
   if var.ndim >= 2:  # map-type: GDAL potential
     # infer or check projection and related parameters       
     if griddef is None:
       lgdal, projection, isProjected, xlon, ylat = getProjection(var, projection=projection)
       if lgdal and xlon is not None and ylat is not None:
-        griddef = GridDefinition(projection=projection, xlon=xlon, ylat=ylat)
+        griddef = GridDefinition(projection=projection, xlon=xlon, ylat=ylat, geotransform=geotransform)
     else:
       # use GridDefinition object 
       if isinstance(griddef,basestring): # load from pickle file
         griddef = loadPickledGridDef(grid=griddef, res=None, filename=None, folder=gridfolder)
-      elif not isinstance(griddef,GridDefinition): raise TypeError
+      elif not isinstance(griddef,GridDefinition): raise TypeError(griddef)
       projection, isProjected, xlon, ylat = griddef.getProjection()
       lgdal = ( ( xlon is not None and ylat is not None ) and # need non-None xlon & ylat
                 ( var.hasAxis(ylat.name) and var.hasAxis(xlon.name)) ) # and need them in the Variable
@@ -560,28 +629,32 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
     var.copy = types.MethodType(copy, var)
         
     # define GDAL-related 'class methods'  
-    def getGDAL(self, load=True, allocate=True, wrap360=False, fillValue=None, lupperleft=False):
+    def getGDAL(self, load=True, allocate=True, wrap360=False, fillValue=None, noDataValue=None, lupperleft=False, lfillNaN=False):
       ''' Method that returns a gdal dataset, ready for use with GDAL routines. '''
       lperi = False
       if self.gdal and self.projection is not None:
         axstr = "'x' and 'y'" if isProjected else "'lon' and 'lat'"
         if (var.axisIndex(xlon) != var.ndim-1) or (var.axisIndex(ylat) != var.ndim-2):
           raise NotImplementedError, "Horizontal axes ({:s}) have to be the last indices.".format(axstr)
+        if fillValue is None:
+          if self.fillValue is not None: fillValue = self.fillValue  # use default 
+          elif self.dtype is not None: fillValue = ma.default_fill_value(self.dtype)
+          else: raise GDALError, "Need Variable with valid dtype to pre-allocate GDAL array!"
+        if noDataValue is None: noDataValue = fillValue
         if load:
           if not self.data: self.load()
           if not self.data: raise DataError, 'Need data in Variable instance in order to load data into GDAL dataset!'
-          data = self.getArray(unmask=True)  # get unmasked data
+          data = self.getArray(unmask=True, fillValue=fillValue)  # get unmasked data
           data = data.reshape(self.bands, self.mapSize[0], self.mapSize[1])  # reshape to fit bands
           if lperi: 
             tmp = np.zeros((self.bands, self.mapSize[0], self.mapSize[1]+1))
             tmp[:,:,0:-1] = data; tmp[:,:,-1] = data[:,:,0]
             data = tmp
         elif allocate: 
-          if fillValue is None:
-            if self.fillValue is not None: fillValue = self.fillValue  # use default 
-            elif self.dtype is not None: fillValue = ma.default_fill_value(self.dtype)
-            else: raise GDALError, "Need Variable with valid dtype to pre-allocate GDAL array!"
           data = np.zeros((self.bands,) + self.mapSize, dtype=self.dtype) + fillValue
+        # if we have a fillValue, replace NaN's with the fillValues
+        if lfillNaN and fillValue is not None and np.issubdtype(data.dtype, np.inexact): 
+          data[np.isnan(data)] = fillValue
         # to insure correct wrapping, geographic coordinate systems with longitudes reanging 
         # from 0 to 360 can optionally be shifted back by 180, to conform to GDAL conventions 
         # (the shift will only affect the GDAL Dataset, not the actual Variable) 
@@ -631,7 +704,7 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
           # assign data
           for i in xrange(self.bands):
             dataset.GetRasterBand(i + 1).WriteArray(data[i, :, :])
-            if self.masked: dataset.GetRasterBand(i + 1).SetNoDataValue(float(self.fillValue))
+            if self.masked: dataset.GetRasterBand(i + 1).SetNoDataValue(float(noDataValue))
       else: dataset = None
       # return dataset
       return dataset
@@ -667,7 +740,7 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
         else: data = dataset.ReadAsArray()[0:self.bands, :, :]  # ReadAsArray(0,0,xe,ye)
         # fix upper/lower corner issue
         if lyf: data = flip(data, axis=-2) # flip y-axis
-        # to insure correct wrapping, geographic coordinate systems with longitudes reanging 
+        # to insure correct wrapping, geographic coordinate systems with longitudes ranging 
         # from 0 to 360 can optionally be shifted back by 180, to conform to GDAL conventions 
         # (the shift will only affect the GDAL Dataset, not the actual Variable) 
         if wrap360:
@@ -736,32 +809,94 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
     var.getMapMask = types.MethodType(getMapMask, var)   
     
     # extension to mean
-    def mapMean(self, mask=None, integral=False, invert=False, squeeze=True, **kwargs):
-      ''' Compute mean over the horizontal axes, optionally applying a 2D shape or mask. '''
+    def mapMean(self, mask=None, integral=False, R=R, metric=None, invert=True, squeeze=True, **kwargs):
+      ''' Compute mean over the horizontal axes, optionally applying a 2D shape or mask or a metric. 
+          N.B.: if the mask shows invalid/masked values as True and valid values as False, set 
+                invert==False (numpy.ma convention; if valid values are shown as True and masked/invalid
+                values as False, leave at invert=True '''
       if not self.data: raise DataError
       # if mask is a shape object, create the mask
       if isinstance(mask,Shape):
         shape = mask 
-        mask = shape.rasterize(griddef=self.griddef, invert=invert, asVar=False)
+        mask = shape.rasterize(griddef=self.griddef, invert=not invert, asVar=False)
       else: shape = None      
       # determine relevant axes
-      axes = {self.xlon.name:None, self.ylat.name:None} # the relevant map axes; entire coordinate
-      # temporarily mask 
-      if self.masked: oldmask = ma.getmask(self.data_array) # save old mask
+      axes = {self.xlon.name:None, self.ylat.name:None,} # the relevant map axes; entire coordinate
+      kwargs.update(axes)# update dictionary with arguments to be passes to self.mean()
+      if 'keepname' not in kwargs: kwargs['keepname'] = True
+      # apply temporary mask, if necessary
+      if mask is not None:
+          if self.masked: oldmask = ma.getmask(self.data_array) # save old mask
+          else: oldmask = None
+          self.mask(mask=mask, invert=invert, merge=True) # new mask on top of old mask
+          # N.B.: invert=True is necessary, if the mask indicates True for valid values and Fals for missing/invalid values
       else: oldmask = None
-      self.mask(mask=mask, invert=invert, merge=True) # new mask on top of old mask
-      # compute average
-      kwargs.update(axes)# update dictionary
-      newvar = self.mean(**kwargs)
-      if squeeze: newvar.squeeze()
-      # if integrating
-      if integral:
-        if not self.isProjected: raise NotImplementedError
-        dx = self.geotransform[1]; dy = self.geotransform[5] 
-        area = (1-mask).sum()*dx*dy
-        newvar *= area # in-place scaling
-        if self.xlon.units == self.ylat.units: newvar.units = '{} {}^2'.format(newvar.units,self.ylat.units) 
-        else: newvar.units ='{} {} {}'.format(newvar.units,self.xlon.units,self.ylat.units)
+      ## compute average
+      # determine metric
+      if not self.isProjected and metric is None: metric = 'lat' # defaulf for spherical coordinates
+      if metric:
+          units = None
+          if isinstance(metric,basestring):
+              # special metrics
+              if metric[:3].lower() == 'lat'  and not self.isProjected: 
+                  metric = sphericalMetric(self.ylat, integral=integral, R=R, asVar=False)
+                  # adjust shape for broadcasting
+                  shape = [1]*self.ndim
+                  shape[self.axisIndex(self.ylat.name)] = metric.size
+                  metric = metric.reshape(shape)
+                  units = 'm^2' if integral else ''
+              else: 
+                  raise NotImplementedError("Special keyword for metric not recognized: '{}'".format(metric))
+          if isinstance(metric,Variable):
+              # metric is given as a Variable (or Axis)
+              if metric.ndim == 1:
+                  axname = metric.axes[0].name
+                  if not ( self.hasAxis(axname) and metric.shape[0] == len(self.getAxis(axname)) ):
+                      raise AxisError("Metric axes are incompatible with Variable: {} != {}".format(metric.shape,self.shape))
+                  shape = [1]*self.ndim
+                  shape[self.axisIndex(axname)] = metric.shape[0]
+              elif metric.ndim == 2:
+                  for lax,rax in zip(self.axes[-2:],metric.axes):
+                    if lax != rax: # check axes 
+                      raise AxisError("Metric axes are incompatible with Variable: {} != {}".format(metric.shape,self.shape))
+                  shape = (1,)*(self.ndim-2)+metric.shape
+              metric = metric[:].reshape(shape)
+              units = metric.units
+          if not isinstance(metric,np.ndarray): raise TypeError(metric)
+          # now the metric can only be a Numpy array
+          if metric.ndim == self.ndim: 
+              if not all(l==r or l==1 for l,r in zip(metric.shape,self.shape)):
+                  raise AxisError("Metric axes are incompatible with Variable: {} != {}".format(metric.shape,self.shape)) 
+          elif metric.ndim == 2:
+              if not all(l==r or l==1 for l,r in zip(metric.shape,self.shape[-2:])):
+                  raise AxisError("Metric axes are incompatible with Variable: {} != {}".format(metric.shape,self.shape))
+              shape = (1,)*(self.ndim-2)+metric.shape
+              metric = metric.reshape(shape)
+          if not integral: 
+              if self.masked:
+                  masked_metric = np.broadcast_to(metric, shape=self.shape, subok=True)
+                  mean_metric = ma.array(masked_metric, mask=self.getMask()).mean()
+              else: mean_metric = metric.mean()
+              metric = metric / mean_metric # normalize metric
+          # make copy, apply metric and average
+          newvar = self.deepcopy() # use a copy of the variable
+          newvar *= metric # apply metric and normalize (first)
+          if integral:
+              newvar = newvar.sum(**kwargs) # area is included in metric
+              if units: newvar.units = '{} {}'.format(newvar.units,units)
+          else: 
+              newvar = newvar.mean(**kwargs) # simple mean and same units 
+      else:
+          newvar = self.mean(**kwargs)
+          if squeeze: newvar.squeeze()
+          # if integrating
+          if integral:
+            da = self.geotransform[1] * self.geotransform[5] 
+            if invert: area = mask.sum()*da
+            else: area = (1-mask).sum()*da
+            newvar *= area # in-place scaling
+            if self.xlon.units == self.ylat.units: newvar.units = '{} {}^2'.format(newvar.units,self.ylat.units) 
+            else: newvar.units ='{} {} {}'.format(newvar.units,self.xlon.units,self.ylat.units)
       # lift mask
       if oldmask is not None: 
         self.data_array.mask = oldmask # change back to old mask
@@ -775,7 +910,7 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
     
     # save variable as Arc/Info ASCII Grid / ASCII raster file using GDAL
     def ASCII_raster(self, prefix=None, folder=None, ext='.asc', filepath=None, wrap360=False, 
-                     fillValue=None, lcoord=False, lfortran=True, formatter=None):
+                     fillValue=None, noDataValue=None, lcoord=False, lfortran=True, formatter=None):
       ''' Export data to  Arc/Info ASCII Grid (ASCII raster format); if no filename is given, the filename will 
           be constructed from the variable name and the slice; note that each file can only contain a single 
           horizontal slice. 
@@ -808,7 +943,8 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
         #       sliced recursively until they are 2D; at this point the recursion ends and the 
         #       sliced dataset/Variable can be exported to ASCII raster format (one per file).
         # get GDAL datast
-        dataset = getGDAL(self, load=True, allocate=True, wrap360=wrap360, fillValue=fillValue, lupperleft=True)
+        dataset = getGDAL(self, load=True, allocate=True, wrap360=wrap360, lupperleft=True, 
+                          lfillNaN=True, fillValue=fillValue, noDataValue=noDataValue)
         # N.B.: apparently the raster driver always assumes that the geotransform reference point is the upper left corner
         # get ASCII raster file driver
         ascii = gdal.GetDriverByName('AAIGrid')
@@ -849,7 +985,7 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
           else: pf = prefix.format(i+one) # start index at 1 --- Fortran convention
           # now call this function recursively for every slice, until input is 2D
           filepath = ASCII_raster(slcvar, prefix=pf, folder=folder, ext=ext, filepath=None, 
-                                  wrap360=wrap360, fillValue=fillValue)
+                                  wrap360=wrap360, fillValue=fillValue, noDataValue=noDataValue)
           if isinstance(filepath, basestring): filelist.append(filepath)
           else: filelist.extend(filepath)
           # N.B.: the function basically returns the last filepath
@@ -862,7 +998,8 @@ def addGDALtoVar(var, griddef=None, projection=None, geotransform=None, gridfold
   # # the return value is actually not necessary, since the object is modified immediately
   return var
 
-def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, gridfolder=None, lwrap360=None, geolocator=False):
+def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, gridfolder=None, 
+                     lwrap360=None, geolocator=False, lforce=False, loverride=False):
   ''' 
     A function that adds GDAL-based geographic projection features to an existing Dataset instance
     and all its Variables.
@@ -881,26 +1018,48 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
   '''
   # check some special conditions
   assert isinstance(dataset, Dataset), 'This function can only be used to add GDAL functionality to a \'Dataset\' instance!'
+  
+  ## skip, if already GDAL-ensembled (and not in override mode)
+  if not loverride and 'gdal' in dataset.__dict__: 
+      return dataset # return immediately
+    
   # only for 2D variables!
-  if len(dataset.axes) >= 2:  # else not a map-type
+  if griddef:
     # infer or check projection and related parameters       
-    if griddef is None:
-      lgdal, projection, isProjected, xlon, ylat = getProjection(dataset, projection=projection)
-    else:
-      # use GridDefinition object 
-      if isinstance(griddef,basestring): # load from pickle file
-        griddef = loadPickledGridDef(grid=griddef, res=None, filename=None, folder=gridfolder)
-      elif isinstance(griddef,GridDefinition): pass 
-      else: raise TypeError
-      lgdal, projection, isProjected, xlon, ylat = getProjection(dataset, projection=griddef.projection)
-      # safety checks
-      xlon_name,ylat_name = ('x','y') if isProjected else ('lon','lat')
-      assert dataset.axes[xlon_name].units == griddef.xlon.units and np.all(dataset.axes[xlon_name][:] == griddef.xlon[:])
-      assert dataset.axes[ylat_name].units == griddef.ylat.units and np.all(dataset.axes[ylat_name][:] == griddef.ylat[:])
-      assert all([dataset.axes[xlon_name] == var.getAxis(xlon_name) for var in dataset.variables.values() if var.hasAxis(xlon_name)])
-      assert all([dataset.axes[ylat_name] == var.getAxis(ylat_name) for var in dataset.variables.values() if var.hasAxis(ylat_name)])
+    # use GridDefinition object 
+    if isinstance(griddef,basestring): # load from pickle file
+      griddef = loadPickledGridDef(grid=griddef, res=None, filename=None, folder=gridfolder)
+    elif isinstance(griddef,GridDefinition): pass 
+    else: raise TypeError
+    if lforce and griddef.xlon.name not in dataset.axes: dataset.addAxis(griddef.xlon)
+    if lforce and griddef.ylat.name not in dataset.axes: dataset.addAxis(griddef.ylat)
+    lgdal, projection, isProjected, xlon, ylat = getProjection(dataset, projection=griddef.projection)
+    # safety checks
+    xlon_name,ylat_name = ('x','y') if isProjected else ('lon','lat')
+    if xlon_name in dataset.axes:
+      if dataset.axes[xlon_name].units != griddef.xlon.units:
+        raise AxisError("Units of Dataset and GridDef x-axes do not match: {} != {}".format(dataset.axes[xlon_name].units,griddef.xlon.units))
+      if not isEqual(dataset.axes[xlon_name][:], griddef.xlon[:]):
+        bias = np.mean(dataset.axes[xlon_name][:] - griddef.xlon[:])
+        cc = np.corrcoef(dataset.axes[xlon_name][:], griddef.xlon[:])[0,-1]
+        raise AxisError("Coordinates of Dataset and GridDef x-axes are inconsistent! Bias: {} Correltation: {}".format(bias,cc))
+      if any([dataset.axes[xlon_name] != var.getAxis(xlon_name) for var in dataset.variables.values() if var.hasAxis(xlon_name)]):
+        raise AxisError("X-Axes of Variables in Dataset are inconsistent!")
+    if ylat_name in dataset.axes:
+      if dataset.axes[ylat_name].units != griddef.ylat.units:
+        raise AxisError("Units of Dataset and GridDef y-axes do not match: {} != {}".format(dataset.axes[ylat_name].units,griddef.ylat.units))
+      if not isEqual(dataset.axes[ylat_name][:], griddef.ylat[:]):
+        bias = np.mean(dataset.axes[ylat_name][:] - griddef.ylat[:])
+        cc = np.corrcoef(dataset.axes[ylat_name][:], griddef.ylat[:])[0,-1]
+        raise AxisError("Coordinates of Dataset and GridDef y-axes are inconsistent! Bias: {} Correltation: {}".format(bias,cc))
+      if any([dataset.axes[ylat_name] != var.getAxis(ylat_name) for var in dataset.variables.values() if var.hasAxis(ylat_name)]):
+        raise AxisError("Y-Axes of Variables in Dataset are inconsistent!")
+#       assert dataset.axes[ylat_name].units == griddef.ylat.units and np.all(dataset.axes[ylat_name][:] == griddef.ylat[:])
+#       assert all([dataset.axes[ylat_name] == var.getAxis(ylat_name) for var in dataset.variables.values() if var.hasAxis(ylat_name)])
 #       projection, isProjected, xlon, ylat = griddef.getProjection()
 #       lgdal = xlon is not None and ylat is not None # need non-None xlon & ylat        
+  elif griddef is None and len(dataset.axes) >= 2:
+    lgdal, projection, isProjected, xlon, ylat = getProjection(dataset, projection=projection)
   else: lgdal = False
   # modify instance attributes
   dataset.__dict__['gdal'] = lgdal  # all variables have this after going through this process
@@ -1013,7 +1172,7 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
     # add new method to object
     dataset.maskShape = types.MethodType(maskShape, dataset)
     
-    def mapMean(self, mask=None, integral=False, invert=False, squeeze=True, checkAxis=True, coordIndex=True):
+    def mapMean(self, mask=None, integral=False, R=R, metric=None, invert=False, squeeze=True, lcheckAxis=True, coordIndex=True):
       ''' Average entire dataset over horizontal map coordinates; optionally apply 2D mask. '''
       newset = Dataset(name=self.name, varlist=[], atts=self.atts.copy()) 
       # N.B.: the returned dataset will not be GDAL enabled, because the map dimensions will be gone! 
@@ -1024,20 +1183,30 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
       else: shape = None
       # relevant axes
       axes = {self.xlon.name:None, self.ylat.name:None} # the relevant map axes; entire coordinate
+      # determine default metric
+      if not self.isProjected and metric is None: metric = 'lat' # defaulf for spherical coordinates
+      if isinstance(metric,basestring):
+          # special metrics
+          if metric[:3].lower() == 'lat'  and not self.isProjected: 
+              metric = sphericalMetric(self.ylat, integral=integral, R=R, asVar=True)
+          else: 
+              raise NotImplementedError("Special keyword for metric not recognized: '{}'".format(metric))
+      if isinstance(metric,Variable): 
+          if not all([self.hasAxis(ax.name) for ax in metric.axes]): raise AxisError(metric)
+          if ( not integral and metric.units ) or ( integral and not metric.units ): raise VariableError(metric)
+      elif not metric is None: raise TypeError(metric)
       # loop over variables
       for var in self.variables.values():
         # figure out, which axes apply
         tmpax = {key:value for key,value in axes.iteritems() if var.hasAxis(key)}
         # get averaged variable
         if len(tmpax) == 2:
-          newset.addVariable(var.mapMean(mask=mask, integral=integral, invert=invert, coordIndex=coordIndex, 
-                                       squeeze=True, checkAxis=True), copy=False) # new variable/values anyway
+          newset.addVariable(var.mapMean(mask=mask, integral=integral, R=R, metric=metric, invert=invert, keepname=True,
+                                         squeeze=squeeze, lcheckAxis=lcheckAxis, asVar=True), copy=False) # new variable/values anyway
         elif len(tmpax) == 1:
-          newset.addVariable(var.mean(coordIndex=coordIndex, squeeze=True, checkAxis=True, asVar=True, 
-                                      **tmpax), copy=False) # new variable/values anyway        
+          newset.addVariable(var.mean(squeeze=squeeze, lcheckAxis=lcheckAxis, asVar=True, keepname=True, **tmpax), copy=False) # new variable/values anyway        
         elif len(tmpax) == 0: 
-          newset.addVariable(var, copy=True, deepcopy=True) # copy values
-#         else: raise GDALError
+          newset.addVariable(var, copy=True, deepcopy=True) # copy variables and data
       # add some record
       for key,value in axes.iteritems():
         if isinstance(value,(list,tuple)): newset.atts[key] = printList(value)
@@ -1056,7 +1225,7 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
     
     # save variable as Arc/Info ASCII Grid / ASCII raster file using GDAL
     def ASCII_raster(self, varlist=None, prefix=None, folder=None, ext='.asc', wrap360=False, 
-                     fillValue=None, lcoord=False, lfortran=True, formatter=None):
+                     fillValue=None, noDataValue=None, lcoord=False, lfortran=True, formatter=None):
       ''' Export data to  Arc/Info ASCII Grid (ASCII raster format); the filename will be constructed 
           from a prefix, the variable name and the slice; note that each file can only contain a single 
           horizontal slice (2D).  
@@ -1067,7 +1236,7 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
       if isinstance(varlist, (tuple,list)): varlist = {var:None for var in varlist}
       # N.B.: the keys of a varlist are the variables that are to be exported and the values are the
       #       corresponding variable prefixes (instead of the variable names, which is the default)
-      if prefix is None: prefix=dataset.name
+      #if prefix is None: prefix=dataset.name
       if formatter is not None and not isinstance(formatter, (dict)): raise TypeError, formatter
       # N.B.: formatter keys are axes and values are either index formatting strings or tuples
       #       consisting of a new axis name and an index formatter
@@ -1085,8 +1254,8 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
           pf = '{:s}_{:s}'.format(prefix,vartag) if prefix else vartag
           # call export function on each variable
           filelist = var.ASCII_raster(prefix=pf, folder=folder, ext=ext, filepath=None, wrap360=wrap360, 
-                                      fillValue=fillValue, lcoord=lcoord, lfortran=lfortran, 
-                                      formatter=formatter)
+                                      fillValue=fillValue, noDataValue=noDataValue, lcoord=lcoord, 
+                                      lfortran=lfortran, formatter=formatter)
           if isinstance(filelist,basestring): filelist = [filelist]
           filedict[vartag] = filelist
       return filedict
@@ -1099,19 +1268,21 @@ def addGDALtoDataset(dataset, griddef=None, projection=None, geotransform=None, 
 
 ## shapefile contianer class
 class Shape(object):
-  ''' A wrapper class for shapefiles, with some added functionality and raster itnerface '''
+  ''' A wrapper class for shapefiles, with some added functionality and raster interface '''
   
-  def __init__(self, name=None, long_name=None, shapefile=None, folder=None, load=False, ldebug=False):
+  def __init__(self, name=None, long_name=None, shapefile=None, folder=None, data_source=None, 
+               load=False, ldebug=False, shapetype=None):
     ''' load shapefile '''
     if name is not None and not isinstance(name,basestring): raise TypeError
     if folder is not None and not isinstance(folder,basestring): raise TypeError
     if shapefile is not None and not isinstance(shapefile,basestring): raise TypeError
     # resolve file name and open file
     if ldebug: print(' - loading shapefile')
-    if shapefile is None: shapefile = name + '.shp'
-    if name is None: name = os.path.basename(shapefile)
-    if long_name is None: long_name = name
+    if shapefile is None: shapefile = name + '.shp' # will be absolute path
+    elif shapefile[-4:] != '.shp': shapefile = shapefile + '.shp' # and need extension
     if folder is not None: shapefile = folder + '/' + shapefile
+    if name is None: name = os.path.splitext(os.path.basename(shapefile))[0]
+    if long_name is None: long_name = name
     else: folder = os.path.dirname(shapefile)
     if not os.path.exists(shapefile): raise IOError, 'File \'{}\' not found!'.format(shapefile)
     if ldebug: print(' - using shapefile \'{}\''.format(shapefile))
@@ -1120,6 +1291,9 @@ class Shape(object):
     self.long_name = long_name
     self.folder = folder
     self.shapefile = shapefile
+    self.data_source = data_source # source documentation...
+    shapetype = self.__class__.__name__ if shapetype is None else shapetype
+    self.shapetype = shapetype # for specific types of shapes, e.g. Basin, Lake, Prov, Natl
     # load shapefile (or not)
     self._ogr = ogr.Open(shapefile) if load else None
   
@@ -1128,6 +1302,11 @@ class Shape(object):
     ''' access to OGR dataset '''
     if self._ogr is None: self._ogr = ogr.Open(self.shapefile) # load data, if not already done 
     return self._ogr
+  
+  def load(self):
+    ''' load data and return self '''
+    if self._ogr is None: self._ogr = ogr.Open(self.shapefile) # load data, if not already done 
+    return self
   
   def getLayer(self, layer):
     ''' return a layer from the shapefile '''
@@ -1140,8 +1319,8 @@ class Shape(object):
     #if not isinstance(griddef,GridDefinition): raise TypeError # this is always False. probably due to pickling
     if not isinstance(invert,(bool,np.bool)): raise TypeError
     # fill values
-    if invert: inside, outside = 1,0
-    else: inside, outside = 0,1
+    if invert: inside, outside = 0,1
+    else: inside, outside = 1,0
     shp_lyr = self.getLayer(layer) # get shape layer
     # create raster to burn shape onto
     if ldebug: print(' - creating raster')
@@ -1169,76 +1348,58 @@ class Shape(object):
     # return mask array
     return mask  
 
-# a container class for shape meta data
-class ShapeInfo(object): 
-  ''' basin meta data '''
-  def __init__(self, name=None, long_name=None, shapefiles=None, shapetype=None, data_source=None, folder=None):
-    ''' some common operations and inferences '''
-    self.name = name
-    self.long_name = long_name
-    self.data_source = data_source # source documentation...
-    self.folder = folder+long_name+'/' # shapefile always has its own folder
-    self.shapefiles = OrderedDict()
-    for shp in shapefiles:
-      if shp[-4:] == '.shp':
-        self.shapefiles[shp[:-4]] = self.folder + shp
-      else: 
-        self.shapefiles[shp] = self.folder + shp + '.shp'
-    self.outline = self.shapefiles.keys()[0]    
-    self.shapetype = shapetype          
-      
-
-# container class for known shapes with meta data
-class NamedShape(Shape):
-  ''' Just a container for shapes with additional meta information '''
-  def __init__(self, area=None, subarea=None, folder=None, shapefile=None, shapetype=None, shapes_dict=None, load=False, ldebug=False):
-    ''' save meta information; should be initialized from a BasinInfo instance '''
-    # resolve input
-    if isinstance(area,(basestring,ShapeInfo)):
-      if isinstance(area,basestring):
-        if area in shapes_dict: area = shapes_dict[area]
-        else: raise ValueError, 'Unknown area: {}'.format(area)
-      folder = area.folder
-      if subarea is None: 
-        subarea = area.outline
-        name = area.name      
-        long_name = area.long_name
-      elif isinstance(subarea,basestring):
-        name = subarea 
-        long_name = separateCamelCase(subarea, **{area.name:area.long_name})
-      else: raise TypeError
-      if subarea not in area.shapefiles: raise ValueError, 'Unknown subarea: {}'.format(subarea)
-      shapefile = area.shapefiles[subarea]
-      shapetype = area.shapetype            
-    elif isinstance(shapefile,basestring):
-      if folder is not None and isinstance(folder,basestring): shapefile = folder+'/'+shapefile
-      name = area 
-      long_name = None       
-    else: raise TypeError, 'Specify either area & station or folder & shapefile.'
+# a container class that also acts as a shape for the outline
+class ShapeSet(Shape): 
+  ''' a container class for a set of shapes within a common outline and with common meta data; also acts as a Shape '''
+  _ShapeClass = Shape # the class that is used to initialize the shape collection
+  
+  def __init__(self, name=None, long_name=None, shapefiles=None, folder=None, load=False, ldebug=False,
+               data_source=None, outline=None, shapetype=None, **kwargs):
+    ''' initialize shapes '''
+    # sort shapes into ordered dictionary
+    if isinstance(shapefiles,dict):
+      names = shapefiles.keys(); shapefiles = shapefiles.values()
+    else: names = [None]*len(shapefiles)
+    shape_list = []
+    # add to list, if already an instance, otherwise create new shape instance
+    for shapename,shapefile in zip(names,shapefiles):
+      if isinstance(shapefile, self._ShapeClass): shape = shapefile # trivial
+      else: shape = self._ShapeClass(name=shapename, shapefile=shapefile, folder=folder, ldebug=ldebug, load=load, 
+                                     data_source=data_source, shapetype=shapetype, **kwargs)
+      shape_list.append(shape)
+    shapes = OrderedDict(); shapefiles = OrderedDict()
+    for shape in shape_list:
+      shapes[shape.name] = shape; shapefiles[shape.name] = shape.shapefile
+    # determine outline
+    if outline is None: outline = shapes.keys()[0]    
+    # N.B.: the shapefile of the outline will be added by the Shape constructor
+    shapefile = os.path.basename(shapefiles[outline]) # use relaive path and folder
+    folder = os.path.dirname(shapefiles[outline])
     # call Shape constructor
-    super(NamedShape,self).__init__(name=name, long_name=long_name, shapefile=shapefile, load=load, ldebug=ldebug)
-    # add info
-    self.info = area
-    self.shapetype = shapetype 
+    super(ShapeSet,self).__init__(name=name, long_name=long_name, shapefile=shapefile, folder=folder, 
+                                  data_source=data_source, shapetype=shapetype, load=load, ldebug=ldebug, **kwargs)
+    # add remaining attributes
+    self.outline = outline # name of the main shape which traces the outline
+    self.shapefiles = shapefiles # absolute path to actual shapefiles
+    self.shapes = shapes # OrderedDict of Shape instances
+    
+  def getShape(self, name):
+    ''' wrapper method to return requested shape or None '''
+    return self.shapes.get(name,None)
 
 
 ## run a test    
 if __name__ == '__main__':
-
-  from datasets.common import grid_folder
-
+  
   mode = 'read_shape'
   
   ## test reading shapefile
   if mode == 'read_shape':
     
     # load shapefile
-    #folder = shape_folder+'ARB_Aquanty'; shapefile='ARB_Basins_Outline_WGS84.shp'
-    #   folder = '/data/WSC/Basins/Athabasca River Basin/'; shapefile='UpperARB.shp' 
-    #   folder = '/data/WSC/Basins/Fraser River Basin/'; shapefile='WholeFRB.shp'
-    #   folder = '/data/EC/Provinces/Alberta/'; shapefile='Alberta.shp'
-    #   folder = '/data/EC/Provinces/British Columbia/'; shapefile='British Columbia.shp'
-    folder = '/data/EC/Provinces/Manitoba/'; shapefile='Manitoba.shp'
+#     folder = data_root+'/shapes/Provinces/Manitoba/'; shapefile='Manitoba.shp'
+    folder = data_root+'/shapes/Basins/Athabasca River Basin/'; shapefile='WholeARB.shp'
+#     folder = data_root+'/shapes/Basins/South Sasketchewan River/'; shapefile='WholeSSR.shp'
     shape = Shape(folder=folder, shapefile=shapefile)  
     # get mask from shape file
     griddef = loadPickledGridDef('arb2_d02', res=None, folder=grid_folder)

@@ -15,7 +15,7 @@ from datetime import datetime
 import logging   
 import functools  
 # internal imports
-from geodata.misc import DateError, printList
+from geodata.misc import DateError, DatasetError, printList
 from geodata.netcdf import DatasetNetCDF
 from geodata.base import Dataset
 from datasets import gridded_datasets
@@ -61,8 +61,7 @@ def performExtraction(dataset, mode, stnfct, dataargs, loverwrite=False, varlist
   # N.B.: the loading function is necessary, because DataseNetCDF instances do not pickle well 
             
   # get filename for target dataset and do some checks
-  filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, 
-                           grid=stndata.name, period=None, filetype=None) 
+  filename = getTargetFile(dataset=dataset, mode=mode, dataargs=dataargs, lwrite=lwrite, station=stndata.name) 
   
   if ldebug: filename = 'test_' + filename
   if not os.path.exists(avgfolder): raise IOError, "Dataset folder '{:s}' does not exist!".format(avgfolder)
@@ -82,7 +81,7 @@ def performExtraction(dataset, mode, stnfct, dataargs, loverwrite=False, varlist
         # if source file is newer than sink file or if sink file is a stub, recompute, otherwise skip
         if age > srcage and os.path.getsize(filepath) > 1e5: lskip = True
         # N.B.: NetCDF files smaller than 100kB are usually incomplete header fragments from a previous crashed
-      if not lskip: os.remove(filepath) # recompute
+
   
   # depending on last modification time of file or overwrite setting, start computation, or skip
   if lskip:        
@@ -186,6 +185,7 @@ if __name__ == '__main__':
     # Datasets
     datasets = config['datasets']
     resolutions = config['resolutions']
+    unity_grid = config.get('unity_grid',None)
     lLTM = config['lLTM']
     # CESM
     CESM_project = config['CESM_project']
@@ -197,11 +197,13 @@ if __name__ == '__main__':
     WRF_experiments = config['WRF_experiments']
     WRF_filetypes = config['WRF_filetypes']
     domains = config['domains']
+    grid = config.get('grid',None)
     # target data specs
     stations = config['stations']
   else:
     NP = 2 ; ldebug = False # for quick computations
     modes = ('time-series',) # 'climatology','time-series'
+#     modes = ('climatology',) # 'climatology','time-series'
     loverwrite = True
     varlist = None
     periods = []
@@ -210,9 +212,12 @@ if __name__ == '__main__':
 #     periods += [5]
 #     periods += [10]
     periods += [15]
+    grid = None
     # Observations/Reanalysis
-    datasets = []; resolutions = None
+    resolutions = {'CRU':'','GPCC':['025','05','10','25'],'NARR':'','CFSR':['05','031'],'NRCan':'NA12'}; unity_grid = 'arb2_d02'
+    datasets = []
     lLTM = True # also regrid the long-term mean climatologies 
+#     datasets += ['NRCan']; periods = [(1970,2000),(1980,2010)]; lLTM = False
 #     datasets += ['PRISM','GPCC']; periods = None
 #     datasets += ['PCIC']; periods = None
 #     datasets += ['CFSR']; resolutions = {'CFSR':'031'}
@@ -228,23 +233,25 @@ if __name__ == '__main__':
 #     CESM_experiments += ['Ctrl-1', 'Ctrl-A', 'Ctrl-B', 'Ctrl-C']
     CESM_filetypes = ['atm'] # ,'lnd'
     # WRF experiments (short or long name)
-    WRF_project = 'GreatLakes' # only WesternCanada experiments
+    WRF_project = 'WesternCanada' # only WesternCanada experiments
     WRF_experiments = [] # use None to process all CESM experiments
+    WRF_experiments = ['erai-3km','max-3km','max-3km-2100']
 #     WRF_experiments += ['marc-g','marc-gg','marc-g-2050','marc-gg-2050']
 #     WRF_experiments += ['marc-m','marc-mm', 'marc-t','marc-m-2050','marc-mm-2050', 'marc-t-2050']
 #     WRF_experiments += ['erai-g','erai-t']
-    WRF_experiments += ['g-ctrl','g-ens-A','g-ens-B','g-ens-C',]
-    WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
-    WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
+#     WRF_experiments += ['g-ctrl','g-ens-A','g-ens-B','g-ens-C',]
+#     WRF_experiments += ['g-ctrl-2050','g-ens-A-2050','g-ens-B-2050','g-ens-C-2050',]
+#     WRF_experiments += ['g-ctrl-2100','g-ens-A-2100','g-ens-B-2100','g-ens-C-2100',]
 #     WRF_experiments += ['ctrl-1','ctrl-2050','ctrl-2100',]
 #     WRF_experiments += ['max-ctrl','max-ens-A','max-ens-B','max-ens-C',][:1]
 #     WRF_experiments += ['max-ctrl-2050','max-ens-A-2050','max-ens-B-2050','max-ens-C-2050',]
 #     WRF_experiments += ['max-ctrl-2100','max-ens-A-2100','max-ens-B-2100','max-ens-C-2100',]        
     # other WRF parameters 
     domains = None # domains to be processed
-#     WRF_filetypes = ('hydro','xtrm','srfc','lsm') # filetypes to be processed
-    WRF_filetypes = ('aux',)
+    WRF_filetypes = ('hydro','xtrm','srfc','lsm') # filetypes to be processed
+#     WRF_filetypes = ('hydro',)
 #     WRF_filetypes = ('const',); periods = None
+#     grid = 'grw2'
     # station datasets to match    
     stations = dict(EC=('precip',)) # currently there is only one type: the EC weather stations
   
@@ -258,6 +265,9 @@ if __name__ == '__main__':
   CESM_experiments = getExperimentList(CESM_experiments, CESM_project, 'CESM')
   # expand datasets and resolutions
   if datasets is None: datasets = gridded_datasets  
+  if unity_grid is None and 'Unity' in datasets:
+    if WRF_project: unity_grid = import_module('projects.{:s}'.format(WRF_project)).unity_grid
+    else: raise DatasetError("Dataset 'Unity' has no native grid - please set 'unity_grid'.") 
   
   # print an announcement
   if len(WRF_experiments) > 0:
@@ -280,7 +290,7 @@ if __name__ == '__main__':
   # loop over modes
   for mode in modes:
     # only climatology mode has periods    
-    if mode == 'climatology': periodlist = periods
+    if mode == 'climatology': periodlist = [] if periods is None else periods
     elif mode == 'time-series': periodlist = (None,)
     else: raise NotImplementedError, "Unrecognized Mode: '{:s}'".format(mode)
 
@@ -308,19 +318,22 @@ if __name__ == '__main__':
               if resolutions is None: dsreses = mod.LTM_grids
               elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.LTM_grids]  
               for dsres in dsreses: 
-                args.append( (dataset, mode, stnfct, dict(varlist=varlist, period=None, resolution=dsres)) ) # append to list
+                args.append( (dataset, mode, stnfct, dict(varlist=varlist, period=None, resolution=dsres, grid=grid, 
+                                                          unity_grid=unity_grid)) ) # append to list
             # climatologies derived from time-series
             if resolutions is None: dsreses = mod.TS_grids
             elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
             for dsres in dsreses:
               for period in periodlist:
-                args.append( (dataset, mode, stnfct, dict(varlist=varlist, period=period, resolution=dsres)) ) # append to list            
+                args.append( (dataset, mode, stnfct, dict(varlist=varlist, period=period, resolution=dsres, grid=grid, 
+                                                          unity_grid=unity_grid)) ) # append to list            
           elif mode == 'time-series': 
             # regrid the entire time-series
             if resolutions is None: dsreses = mod.TS_grids
             elif isinstance(resolutions,dict): dsreses = [dsres for dsres in resolutions[dataset] if dsres in mod.TS_grids]  
             for dsres in dsreses:
-              args.append( (dataset, mode, stnfct, dict(varlist=varlist, period=None, resolution=dsres)) ) # append to list            
+              args.append( (dataset, mode, stnfct, dict(varlist=varlist, period=None, resolution=dsres, grid=grid, 
+                                                        unity_grid=unity_grid)) ) # append to list            
         
         # CESM datasets
         for experiment in CESM_experiments:
@@ -328,7 +341,7 @@ if __name__ == '__main__':
             for period in periodlist:
               # arguments for worker function: dataset and dataargs       
               args.append( ('CESM', mode, stnfct, dict(experiment=experiment, varlist=varlist, filetypes=[filetype], 
-                                                       period=period, load3D=load3D)) )
+                                                       grid=grid, period=period, load3D=load3D)) )
         # WRF datasets
         for experiment in WRF_experiments:
           for filetype in WRF_filetypes:
@@ -340,7 +353,7 @@ if __name__ == '__main__':
               for period in periodlist:
                 # arguments for worker function: dataset and dataargs       
                 args.append( ('WRF', mode, stnfct, dict(experiment=experiment, varlist=varlist, filetypes=[filetype], 
-                                                        domain=domain, period=period)) )
+                                                        domain=domain, grid=grid, period=period)) )
       
   # static keyword arguments
   kwargs = dict(loverwrite=loverwrite, varlist=varlist)

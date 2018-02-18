@@ -84,7 +84,7 @@ def checkVarlist(varlist, varname=None, ndim=1, bins=None, support=None, method=
   else: raise TypeError
   if not all([isinstance(var,(Variable, NoneType)) for var in varlist]): raise TypeError
   for var in varlist: 
-    if var is not None: var.squeeze() # remove singleton dimensions
+    if var is not None and var.data_array.size > 1: var.squeeze() # remove singleton dimensions
   # evaluate distribution variables on support/bins
   if bins is not None or support is not None:
     varlist = evalDistVars(varlist, bins=bins, support=support, method=method, 
@@ -145,7 +145,10 @@ def getPlotValues(var, checkunits=None, checkname=None, lsmooth=False, lperi=Fal
     if checkname is not None and varname != checkname: # only check plotname! 
       raise VariableError, "Expected variable name '{}', found '{}'.".format(checkname,varname)
   else: varname = var.atts['name']
-  val = var.getArray(unmask=True, copy=True) # the data to plot
+  if np.issubdtype(var.dtype, np.datetime64): val = var.data_array.copy() # need to preserve dates
+  else: val = var.getArray(unmask=True, fillValue=np.NaN, dtype=np.float, copy=True) # the data to plot
+  # N.B.: matplotlib does not understand masked arrays, therefor we have to convert masked values to NaN's
+  #       (and convert the data to float in the process...)
   if var.plot is not None:
     if var.units != var.plot.units: 
       val *=  var.plot.scalefactor
@@ -156,7 +159,7 @@ def getPlotValues(var, checkunits=None, checkname=None, lsmooth=False, lperi=Fal
   if checkunits is not None and  varunits != checkunits: 
     raise VariableError, "Units for variable '{}': expected {}, found {}.".format(var.name,checkunits,varunits) 
   # some post-processing
-  val = val.squeeze()
+  if val.size > 1: val = val.squeeze()
   if lsmooth: val = smooth(val)
   if lperi: 
     if laxis: 

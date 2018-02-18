@@ -8,18 +8,17 @@ Some tools and data that are used by many datasets, but not much beyond that.
 
 # external imports
 from importlib import import_module
+from warnings import warn
 import inspect
 import numpy as np
-import pickle
 import os
 import functools
-from operator import isCallable
 # internal imports
 from utils.misc import expandArgumentList
-from geodata.misc import AxisError, DatasetError, DateError, ArgumentError, EmptyDatasetError, DataError
+from geodata.misc import AxisError, DatasetError, DateError, ArgumentError, EmptyDatasetError, DataError, VariableError
 from geodata.base import Dataset, Variable, Axis, Ensemble
-from geodata.netcdf import DatasetNetCDF, VarNC
-from geodata.gdal import GDALError, addGDALtoDataset, loadPickledGridDef, griddef_pickle
+from geodata.netcdf import DatasetNetCDF
+from geodata.gdal import GDALError, addGDALtoDataset, loadPickledGridDef, grid_folder, shape_folder, data_root
 # import some calendar definitions
 from geodata.misc import name_of_month, days_per_month, days_per_month_365, seconds_per_month, seconds_per_month_365
 
@@ -42,6 +41,7 @@ default_varatts = dict(pmsl     = dict(name='pmsl', units='Pa'), # sea-level pre
                        pwtr     = dict(name='pwtr', units='kg/m^2'), # total precipitable water (kg/m^2)
                        snow     = dict(name='snow', units='kg/m^2'), # snow water equivalent
                        snowh    = dict(name='snowh', units='m'), # snow depth
+                       snwmlt   = dict(name='snwmlt', units='kg/m^2/s'), # snow melt (rate)
                        sfroff   = dict(name='sfroff', units='kg/m^2/s'), # surface run-off                      
                        ugroff   = dict(name='ugroff', units='kg/m^2/s'), # sub-surface/underground run-off      
                        runoff   = dict(name='runoff', units='kg/m^2/s'), # total surface and sub-surface run-off
@@ -65,15 +65,12 @@ shp_params = ['shape_name','shp_long_name','shp_type','shp_area','shp_encl','shp
 stn_params = ['station_name', 'stn_prov', 'zs_err', 'stn_zs', 'stn_lat', 'stn_lon', 'stn_rec_len', 'stn_begin_date', 'stn_end_date']
 # variables contained in the CRU dataset
 CRU_vars = ['T2','Tmin','Tmax','Q2','pet','precip','cldfrc','wetfrq','frzfrq']
-
-# read data root folder from environment variable
-data_root = os.getenv('DATA_ROOT')
-if not data_root: raise ArgumentError, 'No DATA_ROOT environment variable set!'
-if not os.path.exists(data_root): raise DataError, "The data root '{:s}' directory set in the DATA_ROOT environment variable does not exist!".format(data_root)
-
-# standard folder for grids and shapefiles  
-grid_folder = data_root + '/grids/' # folder for pickled grids
-shape_folder = data_root + '/shapes/' # folder for pickled grids
+# list of reanalysis, station, and gridded observational datasets currently available
+reanalysis_datasets = ['CFSR','NARR']
+station_obs_datasets = ['EC','GHCN','WSC']
+gridded_obs_datasets = ['CRU','GPCC','NRCan','PCIC','PRISM','Unity']
+observational_datasets = reanalysis_datasets + station_obs_datasets + gridded_obs_datasets
+timeseries_datasets = ['CFSR','NARR','EC','GHCN','WSC','CRU','GPCC','NRCan',]
 
 
 ## utility functions for datasets
@@ -86,14 +83,31 @@ def addLoadFcts(namespace, dataset, comment=" (Experiment and Ensemble lists are
   for name,fct in vardict.iteritems():
     if inspect.isfunction(fct) and name[:4] == 'load':
       # check valid arguments (omit others)
-      arglist = inspect.getargs(fct.func_code)[0]
-      fctargs = {key:value for key,value in kwargs.iteritems() if key in arglist}
+      arglist = inspect.getargs(fct.func_code)
+      arglist = None if arglist[2] is not None else arglist[0]
+      fctargs = {key:value for key,value in kwargs.iteritems() if arglist is None or  key in arglist}
       # apply arguments and update doc-string
       newfct = functools.partial(fct, **fctargs)
       newfct.__doc__ = fct.__doc__ + comment # copy doc-string with comment
       namespace[name] = newfct
   # not really necessary, since dicts are passed by reference
   return namespace
+
+
+def getRootFolder(dataset_name=None, fallback_name=None, data_root=data_root):
+    ''' figure out dataset root folder from environment variable and fallbacks '''
+    root_folder = os.getenv(dataset_name+'_ROOT',None) # no modification necessary
+    if not root_folder or not os.path.exists(root_folder):
+        tmp = os.getenv('WRF_ROOT',None)
+        if tmp: root_folder = tmp.replace('WRF',dataset_name)
+    if not root_folder or not os.path.exists(root_folder):
+        root_folder = '{:s}/{:s}/'.format(data_root,dataset_name) # the dataset root folder
+    if not root_folder:
+        raise IOError("No environment variable to indicate dataset root folder found")
+    if not os.path.exists(root_folder): 
+        raise DataError("The dataset root '{:s}' directory set in the HGS_ROOT or WRF_ROOT environment variables does not exist!".format(root_folder))
+    if root_folder[-1] != '/': root_folder += '/'
+    return root_folder
 
 
 def nullNaN(data, var=None, slc=None):
@@ -111,9 +125,9 @@ def timeSlice(period):
 def addLandMask(dataset, varname='precip', maskname='landmask', atts=None):
   ''' Add a landmask variable with meta data from a masked variable to a dataset. '''
   # check
-  if not isinstance(dataset,Dataset): raise TypeError
+  if not isinstance(dataset,Dataset): raise TypeError(dataset)
   if dataset.hasVariable(maskname): 
-    raise DatasetError, "The Dataset '%s' already has a field called '%s'."%(dataset.name,maskname)
+    raise DatasetError("The Dataset '%s' already has a field called '%s'."%(dataset.name,maskname))
   # attributes and meta data
   if atts is None:
     atts = default_varatts[maskname].copy()
@@ -124,8 +138,8 @@ def addLandMask(dataset, varname='precip', maskname='landmask', atts=None):
   axes = var.axes[-2:] # last two axes (i.e. map axes)
   data = var.getMask().__getitem__((0,)*(var.ndim-2)+(slice(None),)*2)
   if 'gdal' in dataset.__dict__ and dataset.gdal:
-    if dataset.xlon not in axes or dataset.ylat not in axes: raise AxisError
-  if not all([ax.name in ('x','y','lon','lat') for ax in axes]): raise AxisError
+    if dataset.xlon not in axes or dataset.ylat not in axes: raise AxisError(dataset.axes)
+  if not all([ax.name in ('x','y','lon','lat') for ax in axes]): raise AxisError(dataset.axes)
   # create variable and add to dataset
   if isinstance(dataset, DatasetNetCDF) and 'w' in dataset.mode: 
     dataset.addVariable(Variable(axes=axes, name=maskname, data=data, atts=atts), asNC=True)
@@ -137,7 +151,7 @@ def addLandMask(dataset, varname='precip', maskname='landmask', atts=None):
 # annotate dataset with names and length of months (for climatology mostly)
 def addLengthAndNamesOfMonth(dataset, noleap=False, length=None, names=None):
   ''' Function to add the names and length of month to a NetCDF dataset. '''
-  if not isinstance(dataset,Dataset): raise TypeError
+  if not isinstance(dataset,Dataset): raise TypeError(dataset)
   # attributes
   lenatts = dict(name='length_of_month', units='days',long_name='Length of Month')
   stratts = dict(name='name_of_month', units='', long_name='Name of the Month')
@@ -168,65 +182,80 @@ def addLengthAndNamesOfMonth(dataset, noleap=False, length=None, names=None):
 #   return precip
 
 
-# transform function to convert monthly precip amount into precip rate on-the-fly
-def transformPrecip(data, l365=False, var=None, slc=None):
-  ''' convert monthly precip amount to SI units (mm/s) '''
-  if not isinstance(var,VarNC): raise TypeError
-  if var.units == 'kg/m^2/month' or var.units == 'mm/month':
-    assert data.ndim == var.ndim
-    tax = var.axisIndex('time')
+# apply a periodic monthly scalefactor or offset
+def monthlyTransform(var=None, data=None, slc=None, time_axis='time', lvar=None, scalefactor=None, offset=None, linplace=True):
+    ''' apply a periodic monthly scalefactor or offset to a variable '''
+    # check input
+    if data is None: 
+        data = var.data_array
+        if lvar is None: lvar = True
+    elif not isinstance(data,np.ndarray): raise TypeError(data)
+    if slc is None and ( data.ndim != var.ndim or data.shape != var.shape ):
+        raise DataError("Dimensions of data array and Variable are incompatible!\n {} != {}".format(data.shape,var.shape))
+    tax = var.axisIndex(time_axis)
+    if scalefactor is not None and not len(scalefactor) == 12: 
+        raise ArgumentError("the 'scalefactor' array/list needs to have length 12 (one entry for each month).\n {}".format(scalefactor))
+    if offset is not None and not len(offset) == 12: 
+        raise ArgumentError("the 'offset' array/list needs to have length 12 (one entry for each month).\n {}".format(offset))
     # expand slices
     if slc is None or isinstance(slc,slice): tslc = slc
     elif isinstance(slc,(list,tuple)): tslc = slc[tax]
     # handle sliced or non-sliced axis
     if tslc is None or tslc == slice(None):
-      # trivial case
-      te = len(var.time)
-      if not ( data.shape[tax] == te and te%12 == 0 ): raise NotImplementedError, "The record has to start and end at a full year!"
+        # trivial case
+        te = len(var.axes[tax])
+        if not ( data.shape[tax] == te and te%12 == 0 ): 
+          raise NotImplementedError("The record has to start and end at a full year!")
     else:  
-      # special treatment if time axis was sliced
-      tlc = slc[tax]
-      ts = tlc.start or 0 
-      te = ( tlc.stop or len(var.time) ) - ts
-      if not ( ts%12 == 0 and te%12 == 0 ): raise NotImplementedError, "The record has to start and end at a full year!"
-      assert data.shape[tax] == te
-      # assuming the record starts some year in January, and we always need to load full years
+        # special treatment if time axis was sliced
+        tlc = slc[tax]
+        ts = tlc.start or 0 
+        te = ( tlc.stop or len(var.axes[tax]) ) - ts
+        if not ( ts%12 == 0 and te%12 == 0 ): raise NotImplementedError("The record has to start and end at a full year!")
+        assert data.shape[tax] == te
+        # assuming the record starts some year in January, and we always need to load full years
     shape = [1,]*data.ndim; shape[tax] = te # dimensions of length 1 will be expanded as needed
-    spm = seconds_per_month_365 if l365 else seconds_per_month
-    data /= np.tile(spm, te/12).reshape(shape) # convert in-place
-    var.units = 'kg/m^2/s'
-  return data      
+    if not linplace: data = data.copy() # make copy if not inplace
+    if scalefactor is not None: data *= np.tile(scalefactor, te/12).reshape(shape) # scale in-place
+    if offset is not None: data += np.tile(offset, te/12).reshape(shape) # shift in-place
+    # return Variable, not just array
+    if lvar:
+        var.data_array = data
+        data = var
+    # return data array (default) or Variable instance
+    return data
+
+# transform function to convert monthly precip amount into precip rate on-the-fly
+def transformMonthly(data=None, var=None, slc=None, time_axis='time', l365=False, lvar=None, linplace=True):
+    ''' convert monthly amount to rate in SI units (e.g. mm/month to mm/s) '''
+    # check input, makesure this makes sense
+    if not isinstance(var,Variable): raise TypeError(var)
+    elif var.units[-6:].lower() != '/month':
+        raise VariableError("Units check failed: this function converts from month accumulations to rates in SI units.")
+    # prepare scalefactor
+    spm = 1. / (seconds_per_month_365 if l365 else seconds_per_month) # divide by seconds
+    # actually scale by month
+    data = monthlyTransform(var=var, data=data, slc=slc, time_axis=time_axis, lvar=lvar, 
+                            scalefactor=spm, offset=None, linplace=linplace)
+    # return data array (default) or Variable instance
+    var.units = var.units[:-6]+'/s' # per second
+    return data      
+transformPrecip = transformMonthly # for backwards compatibility
       
 # transform function to convert days per month into a ratio
-def transformDays(data, l365=False, var=None, slc=None):
-  ''' convert days per month to fraction '''
-  if not isinstance(var,VarNC): raise TypeError
-  if var.units == 'days':
-    assert data.ndim == var.ndim
-    tax = var.axisIndex('time')
-    # expand slices
-    if slc is None or isinstance(slc,slice): tslc = slc
-    elif isinstance(slc,(list,tuple)): tslc = slc[tax]
-    # handle sliced or non-sliced axis
-    if tslc is None or tslc == slice(None):
-      # trivial case
-      te = len(var.time)
-      if not ( data.shape[tax] == te and te%12 == 0 ): 
-        raise NotImplementedError, "The record has to start and end at a full year!"
-    else:  
-      # special treatment if time axis was sliced
-      tlc = slc[tax]
-      ts = tlc.start or 0 
-      te = ( tlc.stop or len(var.time) ) - ts
-      if not ( ts%12 == 0 and te%12 == 0 ): 
-        raise NotImplementedError, "The record has to start and end at a full year!"
-      assert data.shape[tax] == te
-      # assuming the record starts some year in January, and we always need to load full years
-    shape = [1,]*data.ndim; shape[tax] = te # dimensions of length 1 will be expanded as needed
-    spm = days_per_month_365 if l365 else days_per_month
-    data /= np.tile(spm, te/12).reshape(shape) # convert in-place
+def transformDays(data=None, var=None, slc=None, l365=False, lvar=None, linplace=True):
+    ''' convert days per month to fraction '''
+    # check input, makesure this makes sense
+    if not isinstance(var,Variable): raise TypeError(var)
+    elif var.units[:4].lower() != 'days':
+        raise VariableError("Units check failed: this function converts from days per month to fractions.")
+    # prepare scalefactor
+    dpm = 1. / (days_per_month_365 if l365 else days_per_month ) # divide by days
+    # actually scale by month
+    data = monthlyTransform(var=var, data=data, slc=slc, lvar=lvar, scalefactor=dpm, offset=None, linplace=linplace)
+        # return data array (default) or Variable instance
     var.units = '' # fraction
-  return data      
+    return data      
       
       
 ## functions to load a dataset
@@ -235,8 +264,9 @@ def transformDays(data, l365=False, var=None, slc=None):
 def translateVarNames(varlist, varatts):
   ''' Simple function to replace names in a variable list with their original names as inferred from the 
       attributes dictionary. Note that this requires the dictionary to have the field 'name'. '''
+  warn("WARNING: this function is deprecated - the functionality is not handled by DatasetNetCDF directly")
   if isinstance(varlist,basestring): varlist = [varlist]
-  if not isinstance(varlist,(list,tuple,set)) or not isinstance(varatts,dict): raise TypeError 
+  if not isinstance(varlist,(list,tuple,set)) or not isinstance(varatts,dict): raise TypeError(varlist)
   varlist = list(varlist) # make copy, since operation is in-place, and to avoid interference
   # cycle over names in variable attributes (i.e. final names, not original names)  
   for key,atts in varatts.iteritems():
@@ -247,12 +277,17 @@ def translateVarNames(varlist, varatts):
 
 
 # universal function to generate file names for climatologies and time-series
-def getFileName(name=None, resolution=None, period=None, filetype='climatology', grid=None, filepattern=None):
+def getFileName(name=None, resolution=None, period=None, grid=None, shape=None, station=None, 
+                filetype='climatology', filepattern=None):
   ''' A function to generate a standardized filename for climatology and time-series files, based on grid type and period.  '''
   if name is None: name = ''
   # grid (this is a *non-native grid*)
-  if grid is None or grid == name: gridstr = ''
+  if ( not grid ) or grid == name: gridstr = ''
   else: gridstr = '_{0:s}'.format(grid.lower()) # only use lower case for filenames
+  # prepend shape or station type before grid 
+  if shape and station: raise ArgumentError
+  elif shape: gridstr = '_{0:s}{1:s}'.format(shape,gridstr)
+  elif station: gridstr = '_{0:s}{1:s}'.format(station,gridstr)
   # resolution is the native resolution (behind dataset name, prepended to the grid 
   if resolution: gridstr = '_{0:s}{1:s}'.format(resolution,gridstr)
   # period
@@ -273,46 +308,45 @@ def getFileName(name=None, resolution=None, period=None, filetype='climatology',
     # assemble filename
     if filepattern is None: filepattern = name.lower() + '{0:s}_clim{1:s}.nc' 
     filename = filepattern.format(gridstr,periodstr)
-  else: raise NotImplementedError, "Unrecognized filetype: '{:s}'".format(filetype)
+  else: raise NotImplementedError("Unrecognized filetype/mode: '{:s}'".format(filetype))
   # return final name
-  assert filename == filename.lower(), "By convention, climatology files only have lower-case names!"
-  return filename
+  return filename.lower() # By convention, climatology files only have lower-case names
   
   
 # common climatology load function that will be imported by datasets (for backwards compatibility)
-def loadObs(name=None, folder=None, resolution=None, period=None, grid=None, varlist=None, 
-             varatts=None, filepattern=None, filelist=None, projection=None, geotransform=None, 
-             axes=None, lautoregrid=None):
+def loadObs(name=None, title=None, folder=None, resolution=None, period=None, grid=None, varlist=None, 
+             varatts=None, filepattern=None, filelist=None, filemode='r', projection=None, geotransform=None, 
+             griddef=None, axes=None, lautoregrid=None):
   ''' A function to load standardized observational climatologies. '''
-  return loadObservations(name=name, folder=folder, resolution=resolution, period=period, grid=grid, station=None, 
-                          varlist=varlist, varatts=varatts, filepattern=filepattern, filelist=filelist, 
-                          projection=projection, geotransform=geotransform, axes=axes, 
-                          lautoregrid=lautoregrid, mode='climatology')
+  return loadObservations(name=name, title=title, folder=folder, resolution=resolution, period=period, 
+                          grid=grid, station=None, varlist=varlist, varatts=varatts, filepattern=filepattern, 
+                          filelist=filelist, projection=projection, geotransform=geotransform, axes=axes, 
+                          griddef=griddef, lautoregrid=lautoregrid, mode='climatology', filemode=filemode)
 
 # common climatology load function that will be imported by datasets (for backwards compatibility)
-def loadObs_StnTS(name=None, folder=None, resolution=None, varlist=None, station=None, 
-                  varatts=None, filepattern=None, filelist=None, axes=None):
+def loadObs_StnTS(name=None, title=None, folder=None, resolution=None, varlist=None, station=None, 
+                  varatts=None, filepattern=None, filelist=None, filemode='r', axes=None):
     ''' A function to load standardized observational time-series at station locations. '''
-    return loadObservations(name=name, folder=folder, resolution=resolution, station=station, 
+    return loadObservations(name=name, title=title, folder=folder, resolution=resolution, station=station, 
                           varlist=varlist, varatts=varatts, filepattern=filepattern, filelist=filelist, 
-                          projection=None, geotransform=None, axes=axes, period=None, grid=None,
-                          lautoregrid=False, mode='time-series')
+                          projection=None, geotransform=None, griddef=None, axes=axes, period=None, grid=None,
+                          lautoregrid=False, mode='time-series', filemode=filemode)
   
 # universal load function that will be imported by datasets
-def loadObservations(name=None, folder=None, period=None, grid=None, station=None, shape=None, lencl=False, 
-                     varlist=None, varatts=None, filepattern=None, filelist=None, resolution=None, 
-                     projection=None, geotransform=None, axes=None, lautoregrid=None, mode='climatology'):
+def loadObservations(name=None, title=None, folder=None, period=None, grid=None, station=None, shape=None, lencl=False, 
+                     varlist=None, varatts=None, filepattern=None, filelist=None, filemode='r', resolution=None,
+                     projection=None, geotransform=None, griddef=None, axes=None, lautoregrid=None, mode='climatology'):
   ''' A function to load standardized observational datasets. '''
   # prepare input
   if mode.lower() == 'climatology': # post-processed climatology files
     # transform period
-    if period is None or period == '':
-      if name not in ('PCIC','PRISM','GPCC','NARR'): 
-        raise ValueError, "A period is required to load observational climatologies."
+    if period is None or period == '': pass
+#       if name not in ('PCIC','PRISM','GPCC','NARR'): 
+#         raise ValueError("A period is required to load observational climatologies.")
     elif isinstance(period,basestring):
       period = tuple([int(prd) for prd in period.split('-')]) 
     elif not isinstance(period,(int,np.integer)) and ( not isinstance(period,tuple) and len(period) == 2 ): 
-      raise TypeError
+      raise TypeError(period)
   elif mode.lower() in ('time-series','timeseries'): # concatenated time-series files
     period = None # to indicate time-series (but for safety, the input must be more explicit)
     if lautoregrid is None: lautoregrid = False # this can take very long!
@@ -320,10 +354,10 @@ def loadObservations(name=None, folder=None, period=None, grid=None, station=Non
   if isinstance(varlist,basestring): varlist = [varlist] # cast as list
   elif varlist is not None: varlist = list(varlist) # make copy to avoid interference
   # figure out station and shape options
-  if station and shape: raise ArgumentError
+  if station and shape: raise ArgumentError()
   elif station or shape: 
-    if grid is not None: raise NotImplementedError, 'Currently observational station data can only be loaded from the native grid.'
-    if lautoregrid: raise GDALError, 'Station data can not be regridded, since it is not map data.'   
+    if grid is not None: raise NotImplementedError('Currently observational station data can only be loaded from the native grid.')
+    if lautoregrid: raise GDALError('Station data can not be regridded, since it is not map data.')
     lstation = bool(station); lshape = bool(shape)
     grid = station if lstation else shape
     # add station/shape parameters
@@ -335,7 +369,8 @@ def loadObservations(name=None, folder=None, period=None, grid=None, station=Non
     lstation = False; lshape = False
   # varlist (varlist = None means all variables)
   if varatts is None: varatts = default_varatts.copy()
-  if varlist is not None: varlist = translateVarNames(varlist, varatts)
+  #if varlist is not None: varlist = translateVarNames(varlist, varatts)
+  # N.B.: renaming of variables in the varlist is now handled in theDatasetNetCDF initialization routine
   # filelist
   if filelist is None: 
     filename = getFileName(name=name, resolution=resolution, period=period, grid=grid, filepattern=filepattern)
@@ -350,30 +385,32 @@ def loadObservations(name=None, folder=None, period=None, grid=None, station=Non
           griddef = loadPickledGridDef(grid=grid, res=None, folder=grid_folder)
           dataargs = dict(period=period, resolution=resolution)
           performRegridding(name, 'climatology',griddef, dataargs) # default kwargs
-        else: raise IOError, "The dataset '{:s}' for the selected grid ('{:s}') is not available - use the regrid module to generate it.".format(filename,grid) 
-      else: raise IOError, "The dataset file '{:s}' does not exits!\n('{:s}')".format(filename,filepath)
+        else: raise IOError("The dataset '{:s}' for the selected grid ('{:s}') is not available - use the regrid module to generate it.".format(filename,grid) )
+      else: raise IOError("The dataset file '{:s}' does not exits!\n('{:s}')".format(filename,filepath))
+    filelist = [filename]
   # load dataset
-  dataset = DatasetNetCDF(name=name, folder=folder, filelist=[filename], varlist=varlist, varatts=varatts, 
-                          axes=axes, multifile=False, ncformat='NETCDF4')
+  if title is None and name != name.upper(): title = name.title()
+  dataset = DatasetNetCDF(name=name, folder=folder, filelist=filelist, varlist=varlist, varatts=varatts, 
+                          title=title, axes=axes, multifile=False, ncformat='NETCDF4', mode=filemode)
   # mask all shapes that are incomplete in dataset
   if shape and lencl and 'shp_encl' in dataset: 
     dataset.load() # need to load data before masking; is cheap for shape averages, anyway
     dataset.mask(mask='shp_encl', invert=True, skiplist=shp_params)
   # correct ordinal number of shape (should start at 1, not 0)
   if lshape:
-    if dataset.hasAxis('shapes'): raise AxisError, "Axis 'shapes' should be renamed to 'shape'!"
+    if dataset.hasAxis('shapes'): raise AxisError("Axis 'shapes' should be renamed to 'shape'!")
     if not dataset.hasAxis('shape'): 
-      raise AxisError
+      raise AxisError()
     if dataset.shape.coord[0] == 0: dataset.shape.coord += 1
-# figure out grid
+  # figure out grid
   if not lstation and not lshape:
     if grid is None or grid == name:
-      dataset = addGDALtoDataset(dataset, projection=projection, geotransform=geotransform, gridfolder=grid_folder)
+      dataset = addGDALtoDataset(dataset, projection=projection, geotransform=geotransform, griddef=griddef, gridfolder=grid_folder)
     elif isinstance(grid,basestring): # load from pickle file
   #     griddef = loadPickledGridDef(grid=grid, res=None, filename=None, folder=grid_folder)
       # add GDAL functionality to dataset 
       dataset = addGDALtoDataset(dataset, griddef=grid, gridfolder=grid_folder)
-    else: raise TypeError
+    else: raise TypeError(dataset)
     # N.B.: projection should be auto-detected, if geographic (lat/lon)
   return dataset
 
@@ -416,30 +453,10 @@ class BatchLoad(object):
     # return list or ensemble of datasets
     return datasets
 
-
-# convenience shortcut to load only climatologies 
-@BatchLoad
-def loadClim(name=None, WRF_exps=None, CESM_exps=None, **kwargs):
-  ''' A function to load any standardized climatologies; identifies source by name heuristics '''
-  return loadDataset(name=name, station=None, mode='climatology', WRF_exps=WRF_exps, CESM_exps=CESM_exps, **kwargs)
-
-# convenience shortcut to load only staton time-series
-@BatchLoad
-def loadStnTS(name=None, station=None, WRF_exps=None, CESM_exps=None, WRF_ens=None, CESM_ens=None, **kwargs):
-    ''' A function to load any standardized time-series at station locations. '''
-    return loadDataset(name=name, station=station, shape=None, mode='time-series', 
-                       WRF_exps=WRF_exps, CESM_exps=CESM_exps, WRF_ens=WRF_ens, CESM_ens=CESM_ens, **kwargs)
-
-# convenience shortcut to load only regionally averaged time-series
-@BatchLoad
-def loadShpTS(name=None, shape=None, WRF_exps=None, CESM_exps=None, WRF_ens=None, CESM_ens=None, **kwargs):
-    ''' A function to load any standardized time-series averaged over regions. '''
-    return loadDataset(name=name, station=None, shape=shape, mode='time-series', 
-                       WRF_exps=WRF_exps, CESM_exps=CESM_exps, WRF_ens=WRF_ens, CESM_ens=CESM_ens, **kwargs)
   
 # universal load function that will be imported by datasets
-@BatchLoad
-def loadDataset(name=None, station=None, shape=None, mode='climatology', 
+# @BatchLoad
+def loadDataset(name=None, station=None, shape=None, mode='climatology', basin_list=None,
                 WRF_exps=None, CESM_exps=None, WRF_ens=None, CESM_ens=None, **kwargs):
   ''' A function to load any datasets; identifies source by name heuristics. '''
   # some private imports (prevent import errors)  
@@ -457,7 +474,7 @@ def loadDataset(name=None, station=None, shape=None, mode='climatology',
     elif name.lower()[:3] == 'obs': # load observational data for comparison (also includes reanalysis)
       lobs = True; name = None # select dataset based on variable list (in loadCVDP_Obs)
     elif not name in CESM_exps: 
-      raise ArgumentError, "No CVDP dataset matching '{:s}' found.".format(name)
+      raise ArgumentError("No CVDP dataset matching '{:s}' found.".format(name))
     # nothing to do for CESM runs
     dataset_name = 'CESM' # also in CESM module
   elif WRF_ens and ( name in WRF_ens or name[:-4] in WRF_ens ):
@@ -474,11 +491,12 @@ def loadDataset(name=None, station=None, shape=None, mode='climatology',
     dataset_name = 'CESM'
   else:
     # this is most likely an observational dataset
-    if name[:3].lower() == 'obs': dataset_name = 'EC' if station else 'Unity' # alias... 
-    else: dataset_name = name 
+    dataset_name = name
+#     if name[:3].lower() == 'obs': dataset_name = 'EC' if station else 'Unity' # alias... 
+#     else: dataset_name = name 
   # import dataset based on name
   try: dataset = import_module('datasets.{0:s}'.format(dataset_name))
-  except ImportError: raise ArgumentError, "No dataset matching '{:s}' found.".format(dataset_name)
+  except ImportError: raise ArgumentError("No dataset matching '{:s}' found.".format(dataset_name))
   # identify load function  
   if mode.upper() in ('CVDP',):
     load_fct = 'loadCVDP'
@@ -486,7 +504,7 @@ def loadDataset(name=None, station=None, shape=None, mode='climatology',
   else:
     load_fct = 'load{:s}'.format(dataset_name)
     if mode.lower() in ('climatology',):
-      if lensemble and station: raise ArgumentError
+      if lensemble and station: raise ArgumentError(station)
       if station: load_fct += '_Stn'
       elif shape: load_fct += '_Shp'
     elif mode.lower() in ('time-series','timeseries',):
@@ -502,12 +520,13 @@ def loadDataset(name=None, station=None, shape=None, mode='climatology',
   if load_fct in dataset.__dict__: 
     load_fct = dataset.__dict__[load_fct]
   else: 
-    raise ArgumentError, "Dataset '{:s}' has no method '{:s}'".format(dataset_name,load_fct)
+    raise ArgumentError("Dataset '{:s}' has no method '{:s}'".format(dataset_name,load_fct))
   if not inspect.isfunction(load_fct): 
-    raise ArgumentError, "Attribute '{:s}' in module '{:s}' is not a function".format(load_fct.__name__,dataset_name)
+    raise ArgumentError("Attribute '{:s}' in module '{:s}' is not a function".format(load_fct.__name__,dataset_name))
     # N.B.: for example, inspect does not work properly on functools.partial objects, and functools.partial does not return a function 
   # generate and check arguments
-  kwargs.update(name=name, station=station, shape=shape, mode=mode, WRF_exps=WRF_exps, CESM_exps=CESM_exps, WRF_ens=WRF_ens, CESM_ens=CESM_ens)
+  kwargs.update(name=name, station=station, shape=shape, mode=mode, basin_list=basin_list,
+                WRF_exps=WRF_exps, CESM_exps=CESM_exps, WRF_ens=WRF_ens, CESM_ens=CESM_ens)
   if dataset_name == 'WRF': kwargs.update(exps=WRF_exps, enses=WRF_ens)
   elif dataset_name == 'CESM': kwargs.update(exps=CESM_exps, enses=CESM_ens)
   argspec, varargs, keywords = inspect.getargs(load_fct.func_code); del varargs, keywords
@@ -515,24 +534,26 @@ def loadDataset(name=None, station=None, shape=None, mode='climatology',
   # load dataset
   dataset = load_fct(**kwargs)
   if orig_name == name: 
-    if dataset.name != name: raise DatasetError, load_fct.__name__
+    if dataset.name != name: raise DatasetError(load_fct.__name__)
   else: dataset.name = orig_name
   # return dataset
   return dataset
 
+# loadDataset version with BatchLoad capability
+loadDatasets = BatchLoad(loadDataset)
 
 # function to extract common points that meet a specific criterion from a list of datasets
 def selectElements(datasets, axis, testFct=None, master=None, linplace=False, lall=False):
   ''' Extract common points that meet a specific criterion from a list of datasets. 
       The test function has to accept the following input: index, dataset, axis'''
-  if linplace: raise NotImplementedError, "Option 'linplace' does not work currently."
+  if linplace: raise NotImplementedError("Option 'linplace' does not work currently.")
   # check input
-  if not isinstance(datasets, (list,tuple,Ensemble)): raise TypeError
-  if not all(isinstance(dataset,Dataset) for dataset in datasets): raise TypeError 
-  if not isCallable(testFct) and testFct is not None: raise TypeError
+  if not isinstance(datasets, (list,tuple,Ensemble)): raise TypeError(datasets)
+  if not all(isinstance(dataset,Dataset) for dataset in datasets): raise TypeError(dataset)
+  if not callable(testFct) and testFct is not None: raise TypeError(testFct)
   if isinstance(axis, Axis): axis = axis.name
-  if not isinstance(axis, basestring): raise TypeError
-  if lall and master is not None: raise ArgumentError, "The options 'lall' and 'imaster' are mutually exclusive!"
+  if not isinstance(axis, basestring): raise TypeError(axis)
+  if lall and master is not None: raise ArgumentError("The options 'lall' and 'imaster' are mutually exclusive!")
   # save some ensemble parameters for later  
   lnotest = testFct is None
   lens = isinstance(datasets,Ensemble)
@@ -548,9 +569,9 @@ def selectElements(datasets, axis, testFct=None, master=None, linplace=False, la
     for i,dataset in enumerate(datasets): 
       if dataset.name == master: 
         imaster = i; break
-    if imaster is None: raise ArgumentError, "Master '{:s}' not found in datasets".format(master)
+    if imaster is None: raise ArgumentError("Master '{:s}' not found in datasets".format(master))
   else: imaster = master
-  if not imaster is None and not isinstance(imaster,(int,np.integer)): raise TypeError, imaster
+  if not imaster is None and not isinstance(imaster,(int,np.integer)): raise TypeError(imaster)
   elif imaster >= len(datasets) or imaster < 0: raise ValueError 
   maxis = axes.pop(imaster) # extraxt shortest axis for loop
   if lall: 
@@ -582,7 +603,7 @@ def selectElements(datasets, axis, testFct=None, master=None, linplace=False, la
           itpls.append((i,)+tuple(ax.coord.searchsorted(x) for ax in axes))
           # N.B.: since we can expect exact matches, plain searchsorted is fastest (side='left') 
   # check if there is anything left...
-  if len(itpls) == 0: raise DatasetError, "Aborting: no data points match all criteria!"
+  if len(itpls) == 0: raise DatasetError("Aborting: no data points match all criteria!")
   # construct axis indices for each dataset (need to remember to move shortest axis back in line)
   idxs = [[] for ds in datasets] # create unique empty lists
   for itpl in itpls:
@@ -597,13 +618,13 @@ def selectElements(datasets, axis, testFct=None, master=None, linplace=False, la
 
 
 # a function to load station data
-@BatchLoad
-def loadEnsembleTS(names=None, name=None, title=None, varlist=None, aggregation=None, season=None, prov=None, 
-                   slices=None, obsslices=None, years=None, reduction=None, shape=None, station=None, 
-                   constraints=None, filetypes=None, domain=None, ldataset=False, lcheckVar=False, 
-                   lwrite=False, ltrimT=True, name_tags=None, dataset_mode='time-series', lminmax=False,
-                   master=None, lall=True, ensemble_list=None, ensemble_product='inner', lensembleAxis=False,
-                   WRF_exps=None, CESM_exps=None, WRF_ens=None, CESM_ens=None, **kwargs):
+def loadEnsemble(names=None, name=None, title=None, varlist=None, aggregation=None, season=None, prov=None, 
+                 shape=None, station=None, slices=None, obsslices=None, years=None, period=None, obs_period=None, 
+                 reduction=None, constraints=None, filetypes=None, domain=None, grid=None, ldataset=False, 
+                 lcheckVar=False, lwrite=False, ltrimT=True, name_tags=None, dataset_mode='time-series', 
+                 lminmax=False, master=None, lall=True, ensemble_list=None, ensemble_product='inner', 
+                 lensembleAxis=False, WRF_exps=None, CESM_exps=None, WRF_ens=None, CESM_ens=None, 
+                 bias_correction=None, obs_list=observational_datasets, basin_list=None, aggargs=None, **kwargs):
   ''' a convenience function to load an ensemble of time-series, based on certain criteria; works 
       with either stations or regions; seasonal/climatological aggregation is also supported '''
   # prepare ensemble
@@ -616,29 +637,39 @@ def loadEnsembleTS(names=None, name=None, title=None, varlist=None, aggregation=
       for var in shp_params: # necessary to select shapes
         if var not in varlist: varlist.append(var)
   # perpare ensemble and arguments
-  if ldataset and ensemble_list: raise ArgumentError 
+  if ldataset and ensemble_list: raise ArgumentError()
   elif not ldataset: ensemble = Ensemble(name=name, title=title, basetype='Dataset')
   # expand argument list
   if ensemble_list is None: ensemble_list = ['names'] if not ldataset else None
+  elif 'aggregation' in ensemble_list: raise ArgumentError("'aggregation' can not be expanded")
   loadargs = expandArgumentList(names=names, station=station, prov=prov, shape=shape, varlist=varlist, 
-                                mode=dataset_mode, filetypes=filetypes, domains=domain, lwrite=lwrite,
-                                slices=slices, obsslices=obsslices, name_tags=name_tags, ltrimT=ltrimT,
-                                years=years, expand_list=ensemble_list, lproduct=ensemble_product,
-                                lensembleAxis=lensembleAxis)
+                                mode=dataset_mode, filetypes=filetypes, domains=domain, grid=grid, lwrite=lwrite, 
+                                slices=slices, obsslices=obsslices, period=period, obs_period=obs_period, 
+                                years=years, name_tags=name_tags, ltrimT=ltrimT, bias_correction=bias_correction, 
+                                lensembleAxis=lensembleAxis, expand_list=ensemble_list, lproduct=ensemble_product, **kwargs)
   for loadarg in loadargs:
-    # clean up argumetns
+    # clean up arguments
     name = loadarg.pop('names',None); name_tag = loadarg.pop('name_tags',None)
-    slcs = loadarg.pop('slices',None); obsslcs = loadarg.pop('obsslices',None)    
+    slcs = loadarg.pop('slices',None); obsslcs = loadarg.pop('obsslices',None)
+    slcs = dict() if slcs is None else slcs.copy(); 
+    prd = loadarg.pop('period',None); obsprd = loadarg.pop('obs_period',None)
+    if name in obs_list: prd = obsprd or prd 
+    # special handling of periods for time-series: user for slicing by year!
+    mode = loadarg['mode'].lower(); lts = 'time' in mode and 'series' in mode 
+    if lts and prd: slcs['years'] = prd          
+    if obsslcs and name in obs_list: slcs.update(**obsslcs) # add special slices for obs
+    if not lts: 
+      if prd: loadarg['period'] = prd
+      elif 'years' in slcs: loadarg['period'] = slcs['years']
+      if 'years' in slcs: del slcs['years'] # will cause an error with climatologies
+    # N.B.: currently VarNC's can only be sliced once, because we can't combine slices yet
     # load individual dataset
-    dataset = loadDataset(name=name, WRF_exps=WRF_exps, CESM_exps=CESM_exps, WRF_ens=WRF_ens, CESM_ens=CESM_ens, **loadarg)
+    dataset = loadDataset(name=name, WRF_exps=WRF_exps, CESM_exps=CESM_exps, WRF_ens=WRF_ens, 
+                          CESM_ens=CESM_ens, basin_list=basin_list, slices=slcs, **loadarg)
     if name_tag is not None: 
-      if name_tag[0] == '_': dataset.name += name_tag
+      if name_tag.startswith('_'): dataset.name += name_tag
       else: dataset.name = name_tag
     # apply slicing
-    if obsslcs and ( dataset.name[:3].lower() == 'obs' or dataset.name.isupper() ):
-      if slcs is None: slcs = obsslcs
-      else: slcs.update(**obsslcs) # add special slices for obs
-      # N.B.: currently VarNC's can only be sliced once, because we can't combine slices yet
     if slcs: dataset = dataset(lminmax=lminmax, **slcs) # slice immediately 
     if not ldataset: ensemble += dataset.load() # load data and add to ensemble
   # if input was not a list, just return dataset
@@ -665,19 +696,25 @@ def loadEnsembleTS(names=None, name=None, title=None, varlist=None, aggregation=
       if isinstance(op, basestring): ensemble = getattr(ensemble,op)(axis=ax)
       elif isinstance(op, (int,np.integer,float,np.inexact)): ensemble = ensemble(**{ax:op})
   # extract seasonal/climatological values/extrema
-  if (ldataset and len(ensemble)==0): raise EmptyDatasetError, varlist
-  if not ldataset and any([len(ds)==0 for ds in ensemble]): raise EmptyDatasetError, ensemble
-  # N.B.: the operations below should work with Ensembles as well as Datasets 
+  if (ldataset and len(ensemble)==0): raise EmptyDatasetError(varlist)
+  if not ldataset and any([len(ds)==0 for ds in ensemble]): raise EmptyDatasetError(ensemble)
+  # N.B.: the operations below should work with Ensembles as well as Datasets
+  if aggargs is None: aggargs = dict()
   if aggregation:
     method = aggregation if aggregation.isupper() else aggregation.title() 
     if season is None:
-      ensemble = getattr(ensemble,'clim'+method)(taxis='time', **kwargs)
+      ensemble = getattr(ensemble,'clim'+method)(taxis='time', **aggargs)
     else:
-      ensemble = getattr(ensemble,'seasonal'+method)(season=season, taxis='time', **kwargs)
+      ensemble = getattr(ensemble,'seasonal'+method)(season=season, taxis='time', **aggargs)
   elif season: # but not aggregation
-    ensemble = ensemble.seasonalSample(season=season)
+    ensemble = ensemble.seasonalSample(season=season, **aggargs)
   # return dataset
   return ensemble
+
+# convenience versions of loadEnsemble with BatchLoad capability or 'TS' suffix (for backwards-compatibility)
+loadEnsembles = BatchLoad(loadEnsemble)
+loadEnsembleTS = loadEnsemble # for backwards-compatibility
+
 
 ## Miscellaneous utility functions
 
@@ -715,11 +752,14 @@ if __name__ == '__main__':
   
 #   mode = 'pickle_grid'
   mode = 'create_grid'
-  grids = dict( CFSR=['031','05'],
+  grids = dict( 
+                CFSR=['031','05'],
                 GPCC=['025','05','10','25'],
-                CRU=[None],NARR=[None],PRISM=[None],PCIC=[None])
+                NRCan=['NA12','CA12','CA24'],
+                CRU=[None],NARR=[None],PRISM=[None],PCIC=[None]
+               )
     
-  # pickle grid definition
+  ## pickle grid definition
   if mode == 'pickle_grid':
     
     for grid,reses in grids.items():
@@ -744,30 +784,57 @@ if __name__ == '__main__':
           print('GridDefinition object for {0:s} not found!'.format(gridstr))         
         else:
           # save pickle
-          filename = '{0:s}/{1:s}'.format(grid_folder,griddef_pickle.format(gridstr))
-          filehandle = open(filename, 'w')
-          pickle.dump(griddef, filehandle)
-          filehandle.close()
+          filename = pickleGridDef(griddef, lfeedback=True, loverwrite=True, lgzip=True)
           
           print('   Saving Pickle to \'{0:s}\''.format(filename))
           print('')
           
           # load pickle to make sure it is right
           del griddef
-          griddef = loadPickledGridDef(grid, res=res, folder=grid_folder)
+          griddef = loadPickledGridDef(grid, res=res)
           print(griddef)
         print('')
 
   ## create a new grid
   elif mode == 'create_grid':
     
-    # parameters for UTM 17
-    name = 'grw1' # 1km resolution
-    geotransform = [500.e3,1.e3,0,4740.e3,0,1.e3]; size = (132,162)
+    convention='Proj4'
+    ## parameters for UTM 17 GRW grids
+#     name = 'grw1' # 1km resolution
+#     geotransform = [500.e3,1.e3,0,4740.e3,0,1.e3]; size = (132,162)
 #     name = 'grw2' # 5km resolution
 #     geotransform = [500.e3,5.e3,0,4740.e3,0,5.e3]; size = (27,33)
-    projection = "+proj=utm +zone=17 +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
-    # N.B.: [x_0, dx, 0, y_0, 0, dy]
+#     projection = "+proj=utm +zone=17 +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+#     ## parameters for South Nation grids
+#     name = 'snw1' # 9km resolution
+#     geotransform = [401826.125365249,9.e3,0,4851533.71730136,0,9.e3]; size = (22,29)
+#     projection = "+proj=utm +zone=18 +north +ellps=NAD83 +datum=NAD83 +units=m +no_defs"
+#     projection = 'PROJCS["NAD_1983_UTM_Zone_14N",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["false_easting",500000.0],PARAMETER["false_northing",0.0],PARAMETER["central_meridian",-99.0],PARAMETER["scale_factor",0.9996],PARAMETER["latitude_of_origin",0.0],UNIT["Meter",1.0]]'
+#     convention='Wkt'
+    # parameters for UTM 17 Assiniboine River Basin grids
+# #     # Bird River, a subbasin of the Assiniboine River Basin
+# #     name = 'brd1' # 5km resolution 
+#     geotransform = [246749.8, 5.e3, 0., 5524545., 0., 5.e3]; size = ((438573.1-246749.8)/5.e3,(5682634.-5524545.)/5.e3)
+#     print size
+#     size = tuple(int(i) for i in size)
+#     print size
+# #     geotransform = (245.e3, 5.e3, 0., 5524.e3, 0., 5.e3); size = (39,32)
+# #      projection = "+proj=utm +zone=14 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+    # Assiniboine River Basin
+    name = 'asb1' # 5km resolution 
+#     geotransform = [-158200.6 , 5.e3, 0., 5202386., 0., 5.e3]; size = ((791696.2 +158200.6)/5.e3,(5880695.-5202386.)/5.e3)
+#     print size
+#     size = tuple(int(i) for i in size)
+#     print size
+    geotransform = (-159.e3, 5.e3, 0., 5202.e3, 0., 5.e3); size = (191,135)
+    projection = "+proj=utm +zone=14 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+    ## parameters for Canada-wide Lambert Azimuthal Equal-area
+#     name = 'can1' # 5km resolution
+#     llx = -3500000; lly = -425000; urx = 3000000; ury = 4000000; dx = dy = 5.e3
+#     geotransform = [llx, dx, 0., lly, 0., dy]; size = ((urx-llx)/dx,(ury-lly)/dy)
+#     size = tuple(int(i) for i in size)
+#     projection = "+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +ellps=sphere +units=m +no_defs"
+    # N.B.: (x_0, dx, 0, y_0, 0, dy); (xl,yl)
     #       GT(0),GT(3) are the coordinates of the bottom left corner
     #       GT(1) & GT(5) are pixel width and height
     #       GT(2) & GT(4) are usually zero for North-up, non-rotated maps
